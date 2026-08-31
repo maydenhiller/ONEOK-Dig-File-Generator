@@ -928,68 +928,92 @@ def _parse_row_text(text: str) -> dict:
         out["latitude"], out["longitude"] = tail.group(1), tail.group(2)
 
     station = STATION_TOKEN_RE.search(line)
+    search_from = 0
     if station:
         out["station"] = station.group(0)
+        search_from = station.end()
         before = line[: station.start()]
         floats = ANY_FLOAT_RE.findall(before)
         if floats:
             out["odometer"] = floats[-1]
 
-    _read_references(line, out)
+    _read_references(line, out, search_from)
 
     return out
 
 
-def _read_references(line: str, out: dict) -> None:
+TOKEN_2DP_RE = re.compile(r"^\d{1,7}\.\d{2}$")
+HAS_LETTER_RE = re.compile(r"[A-Za-z]")
+
+
+def _read_references(line: str, out: dict, search_from: int = 0) -> None:
     """Read the two reference cells and the distances that follow them.
 
-    Column order is: ... US Weld Distance, DS Weld Distance, US AGM Ref,
-    US AGM Distance, DS AGM Ref, DS AGM Distance, ...
+    Column order is: ... MOP, US Weld Distance, DS Weld Distance,
+    US AGM Ref, US AGM Distance, DS AGM Ref, DS AGM Distance, Joint Length ...
 
-    The references are free text and are not always an AGM - an upstream
-    reference is often "Launch Valve", a downstream one "Receive Valve". What
-    they do share is a station, so "Sta." anchors each one, and the distance
-    that closes a reference is the first two-decimal number after it.
+    Everything between the stationing and the first reference is numeric -
+    depth, wall thickness, SMYS, length, width, o'clock, MOP and the two weld
+    distances - so **the first token containing a letter after the station
+    begins the upstream reference**. That is the anchor.
+
+    Anchoring on "AGM" is wrong: an upstream reference is often "Launch Valve".
+    Anchoring on "Sta." is also wrong: a launch or receive valve reference does
+    not always carry a station, and when it does not, nothing parses and the
+    downstream reference silently falls back to a default.
+
+    Each reference then runs up to the next standalone two-decimal number,
+    which is its distance.
     """
-    numbers = [(m.start(), m.end(), m.group(0)) for m in TWO_DP_RE.finditer(line)]
-    anchors = [m.start() for m in STA_ANCHOR_RE.finditer(line)]
-
-    if len(anchors) < 2:
-        # Fall back to naming AGMs directly, but only when both are AGMs -
-        # guessing which side a lone AGM belongs to is how the wrong
-        # reference ends up on a report.
-        agms = list(AGM_TOKEN_RE.finditer(line))
-        if len(agms) >= 2:
-            anchors = [agms[0].start(), agms[1].start()]
-        else:
-            return
-
-    first, second = anchors[0], anchors[1]
-
-    before = [n for n in numbers if n[1] <= first]
-    after_first = [n for n in numbers if n[0] > first]
-    if not after_first:
+    tokens = [(m.start(), m.end(), m.group(0)) for m in re.finditer(r"\S+", line)]
+    if not tokens:
         return
 
-    # The two numbers before the first reference are the weld distances.
-    if len(before) >= 2:
-        out["us_weld_distance"] = before[-2][2]
-        out["ds_weld_distance"] = before[-1][2]
+    def first_word_index(after_position: int) -> Optional[int]:
+        for index, (begin, _, text) in enumerate(tokens):
+            if begin >= after_position and HAS_LETTER_RE.search(text):
+                return index
+        return None
 
-    us_start, us_end, us_value = after_first[0]
-    out["us_agm_distance"] = us_value
-    reference_start = before[-1][1] if before else 0
-    reference = line[reference_start:us_start].strip(" ,")
+    def first_distance_index(from_index: int) -> Optional[int]:
+        for index in range(from_index, len(tokens)):
+            if TOKEN_2DP_RE.match(tokens[index][2]):
+                return index
+        return None
+
+    us_start = first_word_index(search_from)
+    if us_start is None:
+        return
+    us_distance = first_distance_index(us_start)
+    if us_distance is None:
+        return
+
+    # The two standalone two-decimal numbers before the reference are the
+    # weld distances.
+    preceding = [
+        text for begin, _, text in tokens[:us_start]
+        if TOKEN_2DP_RE.match(text)
+    ]
+    if len(preceding) >= 2:
+        out["us_weld_distance"] = preceding[-2]
+        out["ds_weld_distance"] = preceding[-1]
+
+    reference = line[tokens[us_start][0]:tokens[us_distance][0]].strip(" ,")
     if reference:
         out["us_agm_ref"] = reference
+    out["us_agm_distance"] = tokens[us_distance][2]
 
-    after_second = [n for n in numbers if n[0] > second and n[0] >= us_end]
-    if after_second:
-        ds_start, _, ds_value = after_second[0]
-        out["ds_agm_distance"] = ds_value
-        reference = line[us_end:ds_start].strip(" ,")
-        if reference:
-            out["ds_agm_ref"] = reference
+    ds_start = first_word_index(tokens[us_distance][1])
+    if ds_start is None:
+        return
+    ds_distance = first_distance_index(ds_start)
+    if ds_distance is None:
+        return
+
+    reference = line[tokens[ds_start][0]:tokens[ds_distance][0]].strip(" ,")
+    if reference:
+        out["ds_agm_ref"] = reference
+    out["ds_agm_distance"] = tokens[ds_distance][2]
 
 
 def _cluster_lines(words, tolerance: float = 2.5):
@@ -1175,7 +1199,7 @@ COUNTY_RE = re.compile(r"([A-Z][A-Z .'\-]{1,30}?)\s+COUNTY\b\s*,\s*([A-Z][A-Z ]+
 # can extract onto one line.
 FILENAME_SHEET_RE = re.compile(r"(\d{4,6})[_\-](\d{1,3})\b")
 PLSS_RE = re.compile(r"T\s*(\d+)\s*([NS])\s*,\s*R\s*(\d+)\s*([EW])\s*,\s*SEC\s*(\d+)", re.I)
-ROUTE_RE = re.compile(r"\((\d{4,6}(?:-\d+)?)\)\s*(.+)")
+ROUTE_RE = re.compile(r"\((\d{4,6}(?:-\d+)?)\)\s*([A-Za-z].*)")
 
 
 @dataclass
@@ -1340,15 +1364,22 @@ def _read_title_block(sheet, text, words, page_width, page_height):
 def _find_route_name(text, words, page_width, page_height) -> str:
     """The route name sits in the title block, bottom right of the sheet.
 
-    Several '(10222-2) ...' style strings can appear; the one furthest to the
-    bottom right is the title block entry.
+    Found anywhere on the line rather than only at its start - the label
+    "Route Name:" and other title block text can share an extracted line with
+    the value. Where several candidates exist, the one furthest to the bottom
+    right wins, because that is the title block.
     """
     candidates = []
-    for line in text.splitlines():
-        line = line.strip()
-        match = ROUTE_RE.match(line)
-        if match and len(line) > 12:
-            candidates.append(line)
+    for raw in text.splitlines():
+        match = ROUTE_RE.search(raw)
+        if not match:
+            continue
+        candidate = raw[match.start():].strip()
+        # Trim any trailing label that ran onto the same extracted line.
+        candidate = re.split(r"\s{3,}", candidate)[0].strip()
+        if len(candidate) > 12:
+            candidates.append(candidate)
+
     if not candidates:
         return UNKNOWN
     if len(candidates) == 1:
@@ -1589,38 +1620,50 @@ def _read_hca(sheet, page, words, anchors):
 # ---------------------------------------------------------------------------
 
 def apply_alignment(dig, sheets) -> None:
-    """Fill a dig's alignment-derived fields from the best matching sheet."""
+    """Fill a dig's alignment-derived fields from the uploaded sheets.
+
+    Two kinds of fact come off an alignment sheet and they are applied
+    separately:
+
+    * **Line-level** - the route name. It describes the pipeline, not a
+      position on it, so it applies to every dig on that line and does not
+      wait for a station match. Withholding it when no sheet happens to cover
+      the dig's station was wrong.
+    * **Station-level** - the sheet number, county band, PLSS band and HCA
+      band. These do need the sheet that covers the dig.
+    """
+    if not sheets:
+        dig.warnings.append(
+            "No alignment sheets were uploaded, so line name, alignment "
+            "sheet, tract, legal description and HCA are Unknown."
+        )
+        return
+
+    _apply_line_level(dig, sheets)
+
     matches = [sheet for sheet in sheets if sheet.covers(dig.station_ft)]
     if not matches:
-        if len(sheets) == 1 and sheets[0].station_start is None:
-            # One sheet whose range could not be read: use it rather than
-            # leaving everything blank, but say so.
+        unranged = [sheet for sheet in sheets if sheet.station_start is None]
+        if len(sheets) == 1 and unranged:
             matches = list(sheets)
             dig.warnings.append(
                 f"Could not read a station range from {sheets[0].sheet_id}, "
                 "so it was used anyway. Check the tract, legal description "
                 "and HCA."
             )
-        elif sheets:
+        else:
             dig.warnings.append(
                 f"No alignment sheet covers station "
                 f"{feet_to_station(dig.station_ft)}. Sheets read: "
                 + "; ".join(sheet.describe() for sheet in sheets)
-                + ". Line name, alignment sheet, tract, legal description "
-                "and HCA left as Unknown."
-            )
-            return
-        else:
-            dig.warnings.append(
-                "No alignment sheets were uploaded, so line name, alignment "
-                "sheet, tract, legal description and HCA are Unknown."
+                + ". Alignment sheet, tract, legal description and HCA left "
+                "as Unknown."
             )
             return
 
     sheet = matches[0]
-    if sheet.route_name != UNKNOWN:
-        dig.line_name = sheet.route_name
     dig.alignment_sheet = sheet.sheet_id
+
     county = sheet.county_for(dig.station_ft)
     if county is not None:
         dig.county, dig.state = county.county, county.state
@@ -1645,6 +1688,37 @@ def apply_alignment(dig, sheets) -> None:
     if hca == UNKNOWN and dig.hca_from_digsheet:
         hca = dig.hca_from_digsheet
     dig.hca = hca
+
+
+def _apply_line_level(dig, sheets) -> None:
+    """Route name, and county/state when every sheet agrees on them."""
+    routes = []
+    for sheet in sheets:
+        if sheet.route_name != UNKNOWN and sheet.route_name not in routes:
+            routes.append(sheet.route_name)
+    if len(routes) == 1:
+        dig.line_name = routes[0]
+    elif len(routes) > 1:
+        # Sheets from more than one line were uploaded; the covering sheet
+        # decides, and if none covers this dig it stays Unknown.
+        covering = [s for s in sheets if s.covers(dig.station_ft)]
+        if covering and covering[0].route_name != UNKNOWN:
+            dig.line_name = covering[0].route_name
+        else:
+            dig.warnings.append(
+                "Alignment sheets from more than one line were uploaded ("
+                + "; ".join(routes)
+                + ") and none covers this dig, so the line name is Unknown."
+            )
+
+    counties = []
+    for sheet in sheets:
+        for entry in sheet.counties:
+            pair = (entry.county, entry.state)
+            if pair not in counties:
+                counties.append(pair)
+    if len(counties) == 1:
+        dig.county, dig.state = counties[0]
 
 
 # ==========================================================================
