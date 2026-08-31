@@ -79,14 +79,38 @@ def feet_to_station(feet) -> str:
     return f"{feet // 100}+{feet % 100:02d}"
 
 
+AGM_NAME_RE = re.compile(r"^(AGM\s*\d+)", re.I)
+VALVE_NAME_RE = re.compile(
+    r"^((?:LAUNCH|LAUNCHER|RECEIVE|RECEIVER|MAINLINE|MAIN\s*LINE|CHECK|BLOCK)\s+VALVE)",
+    re.I,
+)
+
+
 def agm_name(reference) -> Optional[str]:
-    """'AGM 520, Sta. 2634+11, 46' NE of C/L Greer Rd' -> 'AGM 520'."""
+    """The short reference name that goes on the report.
+
+    The cell holds a full description - "AGM 520, Sta. 2635+78, 20' N of C/L
+    NE 80 Rd." or "LAUNCH VALVE Danville, Sta. 2582+14" - and the report wants
+    just "AGM 520" or "Launch Valve", so the reference type is taken off the
+    front rather than everything up to the first comma, which would keep the
+    location too.
+    """
     if reference is None:
         return None
-    text = str(reference).strip()
+    text = re.sub(r"\s+", " ", str(reference)).strip()
     if not text:
         return None
-    return text.split(",")[0].strip()
+
+    match = AGM_NAME_RE.match(text)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).upper()
+
+    match = VALVE_NAME_RE.match(text)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).title()
+
+    head = text.split(",")[0].strip()
+    return head.title() if head.isupper() else head
 
 
 @dataclass
@@ -682,14 +706,15 @@ def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
     """
     rows, heading, bands, columns = _read_pdf(data)
 
-    # The patterns are authoritative. Column detection is only a gap filler:
-    # a wrongly merged header can leave a column holding an entire row, which
-    # is present but useless, so it must not win over a pattern match.
-    for row in rows:
-        parsed = _parse_row_text(row["_raw"])
-        for key, value in parsed.items():
-            if value:
-                row[key] = value
+    # With columns, the cells are authoritative. The text patterns are only a
+    # fallback for a sheet whose header could not be read - running them over
+    # a positionally-sorted row would reintroduce the interleaving problem.
+    if not columns:
+        for row in rows:
+            parsed = _parse_row_text(row["_raw"])
+            for key, value in parsed.items():
+                if value:
+                    row[key] = value
 
     anomalies, _ = _select_anomaly_rows(rows, heading, bands)
     if not anomalies:
@@ -705,7 +730,15 @@ def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
 
 
 def _read_pdf(data: bytes):
-    """Pull rows, the page-one heading, highlight bands and columns out of a PDF."""
+    """Pull rows, the page-one heading, highlight bands and columns out of a PDF.
+
+    Cells are recovered from characters in **content-stream order**, not by
+    sorting on position. These sheets are printed from Excel with the text
+    overflowing its columns, so a reference cell and the number beside it
+    physically overlap in x - sorting by position interleaves them into
+    nonsense like "Dan4v9il4le7,." Each cell, however, is emitted as one
+    contiguous run, so a run ends where x jumps backwards or leaves a gap.
+    """
     import pdfplumber
 
     rows: list[dict] = []
@@ -715,19 +748,146 @@ def _read_pdf(data: bytes):
 
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         for index, page in enumerate(pdf.pages):
-            words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
-            if not words:
+            lines = _char_lines(page)
+            if not lines:
                 continue
             if heading is None:
-                heading = _page_heading_dig_name(page, words)
-            found = _detect_pdf_columns(words, page.width)
+                heading = _page_heading_dig_name(
+                    page, page.extract_words(keep_blank_chars=False)
+                )
+            found = _pdf_columns(lines)
             if found:
                 columns = found
             for top, bottom in _highlight_bands(page):
                 bands.append((index, top, bottom))
-            rows.extend(_pdf_rows(words, columns, index))
+            rows.extend(_pdf_rows(lines, columns, index))
 
     return rows, heading, bands, columns
+
+
+def _char_lines(page, tolerance: float = 2.0):
+    """Group characters into visual lines, keeping content-stream order."""
+    buckets: dict = {}
+    for char in page.chars:
+        key = None
+        for existing in buckets:
+            if abs(existing - char["top"]) <= tolerance:
+                key = existing
+                break
+        if key is None:
+            key = char["top"]
+            buckets[key] = []
+        buckets[key].append(char)
+    return [(top, buckets[top]) for top in sorted(buckets)]
+
+
+def _segment_cells(chars, backwards: float = 1.0, gap: float = 2.0):
+    """Split one line's characters into cells at run boundaries."""
+    cells = []
+    current = []
+    previous = None
+    for char in chars:
+        if previous is not None and (
+            char["x0"] < previous["x1"] - backwards
+            or char["x0"] > previous["x1"] + gap
+        ):
+            cells.append(_finish_cell(current))
+            current = []
+        current.append(char)
+        previous = char
+    if current:
+        cells.append(_finish_cell(current))
+    return [cell for cell in cells if cell[2]]
+
+
+def _finish_cell(chars):
+    return (
+        min(c["x0"] for c in chars),
+        max(c["x1"] for c in chars),
+        "".join(c["text"] for c in chars).strip(),
+    )
+
+
+def _pdf_columns(lines):
+    """Column start positions and names, read off the wrapped header block.
+
+    Header text wraps over two printed lines ("US AGM" above "Distance").
+    Both sit at the same x, so the pieces are grouped by their start position
+    and joined top to bottom.
+    """
+    header_lines = []
+    for top, chars in lines[:20]:
+        cells = _segment_cells(chars)
+        if not cells:
+            continue
+        words = " ".join(text for _, _, text in cells).lower().split()
+        hits = sum(1 for word in words if word.strip(":'") in _HEADER_TOKENS)
+        if words and hits >= max(3, len(words) * 0.6):
+            header_lines.append((top, cells))
+    if not header_lines:
+        return None
+
+    groups: dict = {}
+    for top, cells in header_lines:
+        for x0, _, text in cells:
+            key = None
+            for existing in groups:
+                if abs(existing - x0) <= 1.5:
+                    key = existing
+                    break
+            if key is None:
+                key = x0
+                groups[key] = []
+            groups[key].append((top, text))
+
+    columns = []
+    for x0 in sorted(groups):
+        parts = [text for _, text in sorted(groups[x0])]
+        name = _canonical(" ".join(parts))
+        if name:
+            columns.append((x0, name))
+    return columns if len(columns) >= 6 else None
+
+
+def _pdf_rows(lines, columns, page_index: int):
+    """Turn each line's cells into a row keyed by canonical column name."""
+    rows = []
+    for top, chars in lines:
+        cells = _segment_cells(chars)
+        if not cells:
+            continue
+
+        words = " ".join(text for _, _, text in cells).lower().split()
+        hits = sum(1 for word in words if word.strip(":'") in _HEADER_TOKENS)
+        if words and hits >= max(3, len(words) * 0.6):
+            continue  # a header line
+
+        row: dict = {}
+        if columns:
+            for x0, _, text in cells:
+                name = None
+                for start, candidate in columns:
+                    if x0 >= start - 1.0:
+                        name = candidate
+                    else:
+                        break
+                if name is None:
+                    continue
+                row[name] = f"{row[name]} {text}".strip() if name in row else text
+
+        ordered = sorted(cells, key=lambda cell: cell[0])
+        row["_raw"] = " ".join(text for _, _, text in ordered)
+        row["_top"] = top
+        row["_page"] = page_index
+        row["_lead_words"] = [text for _, _, text in ordered[:2]]
+
+        if (
+            row.get("station")
+            or row.get("odometer")
+            or STATION_TOKEN_RE.search(row["_raw"])
+        ):
+            rows.append(row)
+    return rows
 
 
 def _page_heading_dig_name(page, words) -> Optional[str]:
@@ -880,7 +1040,14 @@ def _anomaly_failure_reason(tally, bands) -> str:
 
 
 def _leading_dig_name(row) -> Optional[str]:
-    """The dig name when the row starts with one, i.e. has a Dig Number."""
+    """The dig name when the row carries a Dig Number."""
+    cell = _clean(row.get("dig_number"))
+    if cell:
+        match = DIG_NAME_LEAD_RE.match(cell.replace(" ", "").upper())
+        if match:
+            return match.group(1)
+        return None
+
     words = row.get("_lead_words") or []
     if not words:
         return None
@@ -1036,101 +1203,6 @@ def _looks_like_header(tokens) -> bool:
     return hits >= max(3, len(tokens) * 0.6)
 
 
-def _detect_pdf_columns(words, page_width: float):
-    """Read column x-boundaries off the wrapped header block.
-
-    Best effort only - the parser no longer depends on this succeeding.
-    """
-    lines = _cluster_lines(words)
-    header_lines = []
-    for line in lines[:10]:
-        tokens = [w["text"].strip().lower().rstrip(":") for w in line]
-        if _looks_like_header(tokens):
-            header_lines.append(line)
-        elif header_lines:
-            break
-    if not header_lines:
-        return None
-
-    blocks: list[dict] = []
-    for line in header_lines:
-        for word in line:
-            placed = False
-            for block in blocks:
-                if word["x0"] < block["x1"] + 1.5 and word["x1"] > block["x0"] - 1.5:
-                    block["x0"] = min(block["x0"], word["x0"])
-                    block["x1"] = max(block["x1"], word["x1"])
-                    block["parts"].append((word["top"], word["x0"], word["text"]))
-                    placed = True
-                    break
-            if not placed:
-                blocks.append({
-                    "x0": word["x0"],
-                    "x1": word["x1"],
-                    "parts": [(word["top"], word["x0"], word["text"])],
-                })
-
-    blocks.sort(key=lambda block: block["x0"])
-    for block in blocks:
-        block["parts"].sort()
-        block["text"] = " ".join(part[2] for part in block["parts"])
-        block["canonical"] = _canonical(block["text"])
-
-    named = [block for block in blocks if block["canonical"]]
-    if len(named) < 4:
-        return None
-
-    columns = []
-    for index, block in enumerate(named):
-        left = 0.0 if index == 0 else (named[index - 1]["x1"] + block["x0"]) / 2.0
-        right = (
-            page_width
-            if index == len(named) - 1
-            else (block["x1"] + named[index + 1]["x0"]) / 2.0
-        )
-        columns.append((left, right, block["canonical"]))
-    return columns
-
-
-def _pdf_rows(words, columns, page_index: int):
-    """Turn word clusters into rows, with or without detected columns."""
-    rows = []
-    for line in _cluster_lines(words):
-        tokens = [w["text"].strip().lower().rstrip(":") for w in line]
-        if _looks_like_header(tokens):
-            continue
-
-        raw = " ".join(w["text"] for w in line).strip()
-        if not raw:
-            continue
-
-        row: dict = {}
-        if columns:
-            cells: dict[str, list[str]] = {}
-            for word in line:
-                centre = (word["x0"] + word["x1"]) / 2.0
-                for left, right, name in columns:
-                    if left <= centre < right:
-                        cells.setdefault(name, []).append(word["text"])
-                        break
-            row = {name: " ".join(parts).strip() for name, parts in cells.items()}
-
-        row["_raw"] = raw
-        row["_top"] = line[0]["top"]
-        row["_page"] = page_index
-        # The dig name can be split across words, so keep the first two.
-        row["_lead_words"] = [w["text"] for w in line[:2]]
-
-        # A data row is one that carries a station or an odometer.
-        if (
-            row.get("station")
-            or row.get("odometer")
-            or STATION_TOKEN_RE.search(raw)
-        ):
-            rows.append(row)
-    return rows
-
-
 def pdf_digsheet_report(data: bytes, filename: str) -> dict:
     """What the parser saw in a PDF, for when it finds nothing."""
     try:
@@ -1203,19 +1275,34 @@ ROUTE_RE = re.compile(r"\((\d{4,6}(?:-\d+)?)\)\s*([A-Za-z].*)")
 
 
 @dataclass
-class CountySegment:
-    county: str
-    state: str
-    x_centre: float
-    station_ft: Optional[int] = None
+class BandSegment:
+    """One stretch of a banded row, bounded by the dividers drawn around it."""
+
+    label: str
+    station_low: Optional[int] = None
+    station_high: Optional[int] = None
+
+    def contains(self, station_ft) -> bool:
+        if station_ft is None or self.station_low is None:
+            return False
+        return self.station_low <= station_ft <= self.station_high
+
+    @property
+    def midpoint(self) -> Optional[int]:
+        if self.station_low is None:
+            return None
+        return (self.station_low + self.station_high) // 2
 
 
 @dataclass
-class PlssSegment:
-    label: str
-    section: str
-    x_centre: float
-    station_ft: Optional[int] = None
+class CountySegment(BandSegment):
+    county: str = UNKNOWN
+    state: str = UNKNOWN
+
+
+@dataclass
+class PlssSegment(BandSegment):
+    section: str = ""
 
 
 @dataclass
@@ -1265,31 +1352,10 @@ class AlignmentSheet:
         return low <= station_ft <= high
 
     def county_for(self, station_ft: Optional[int]) -> Optional[CountySegment]:
-        """The county band entry covering this station.
-
-        A sheet can cross a county line, so the entries are placed by their
-        position along the stationing axis, the same as the PLSS band.
-        """
-        if not self.counties:
-            return None
-        if len(self.counties) == 1:
-            return self.counties[0]
-        located = [c for c in self.counties if c.station_ft is not None]
-        if not located or station_ft is None:
-            return self.counties[0]
-        return min(located, key=lambda c: abs(c.station_ft - station_ft))
+        return _segment_for(self.counties, station_ft)
 
     def plss_for(self, station_ft: Optional[int]) -> Optional[PlssSegment]:
-        """The PLSS block whose stretch of the sheet contains this station."""
-        located = [seg for seg in self.plss if seg.station_ft is not None]
-        if not located:
-            return self.plss[0] if len(self.plss) == 1 else None
-        if station_ft is None:
-            return None
-        located.sort(key=lambda seg: seg.station_ft)
-        if len(located) == 1:
-            return located[0]
-        return min(located, key=lambda seg: abs(seg.station_ft - station_ft))
+        return _segment_for(self.plss, station_ft)
 
     def hca_for(self, station_ft: Optional[int]) -> str:
         if not self.hca_reliable or station_ft is None:
@@ -1298,6 +1364,23 @@ class AlignmentSheet:
             if low <= station_ft <= high:
                 return "Yes"
         return "No"
+
+
+def _segment_for(segments, station_ft):
+    """The band segment covering a station, else the nearest one."""
+    if not segments:
+        return None
+    for segment in segments:
+        if segment.contains(station_ft):
+            return segment
+    if len(segments) == 1:
+        return segments[0]
+    if station_ft is None:
+        return None
+    located = [s for s in segments if s.midpoint is not None]
+    if not located:
+        return None
+    return min(located, key=lambda s: abs(s.midpoint - station_ft))
 
 
 # ---------------------------------------------------------------------------
@@ -1315,30 +1398,156 @@ def parse_alignment_sheet(data: bytes, filename: str) -> AlignmentSheet:
         words = page.extract_words(keep_blank_chars=False)
 
         _read_title_block(sheet, text, words, page.width, page.height)
-        anchors = _station_anchors(words)
-        _read_counties(sheet, page, words, anchors)
-        _read_plss(sheet, page, words, anchors)
-        _read_hca(sheet, page, words, anchors)
+
+        axis = _station_axis(words)
+        if axis is None:
+            return sheet
+        anchors, span, plan = axis
+        if sheet.station_start is None:
+            sheet.station_start, sheet.station_end = span
+            sheet.range_is_inferred = True
+
+        bands = _bands(page, words)
+        _read_counties(sheet, page, bands, anchors, plan)
+        _read_plss(sheet, page, bands, anchors, plan)
+        _read_hca(sheet, page, bands, words, anchors, plan)
 
     return sheet
 
 
+def _station_axis(words):
+    """Fit station = slope * x + intercept from the axis tick labels.
+
+    Returns the fit, the span of stations the sheet covers, and the x extent
+    of the plan area. The ticks are the only station labels sharing a
+    horizontal line, so the largest such group is the axis - taking the span
+    from every station-shaped token on the page instead picks up strays and
+    produces a nonsense range.
+    """
+    ticks = []
+    for word in words:
+        text = word["text"].strip()
+        if STATION_RE.fullmatch(text):
+            ticks.append((
+                (word["x0"] + word["x1"]) / 2.0, word["top"], station_to_feet(text)
+            ))
+    if len(ticks) < 3:
+        return None
+
+    rows: dict = {}
+    for x, top, station in ticks:
+        rows.setdefault(int(round(top / 3.0)), []).append((x, station))
+    best = max(rows.values(), key=len)
+    if len(best) < 3:
+        return None
+
+    best.sort()
+    xs = [point[0] for point in best]
+    ys = [point[1] for point in best]
+    count = len(xs)
+    mean_x = sum(xs) / count
+    mean_y = sum(ys) / count
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
+    intercept = mean_y - slope * mean_x
+
+    residuals = [abs(slope * x + intercept - y) for x, y in zip(xs, ys)]
+    spread = max(ys) - min(ys)
+    if spread == 0 or max(residuals) > spread * 0.05:
+        return None
+
+    return (slope, intercept), (min(ys), max(ys)), (min(xs), max(xs))
+
+
+def _station_at(anchors, x) -> Optional[int]:
+    if not anchors or x is None:
+        return None
+    slope, intercept = anchors
+    return int(round(slope * x + intercept))
+
+
+def _bands(page, words):
+    """The sheet's banded rows, split by the full-width horizontal rules.
+
+    Each band carries its row label down the left edge - COUNTY, PLSS, CLASS,
+    HCA - which is what identifies it.
+    """
+    rules = sorted({
+        round(edge["top"], 1)
+        for edge in list(page.lines) + list(page.edges)
+        if abs(edge["bottom"] - edge["top"]) < 1.5
+        and (edge["x1"] - edge["x0"]) > page.width * 0.7
+    })
+
+    bands = []
+    for top, bottom in zip(rules, rules[1:]):
+        if bottom - top < 3:
+            continue
+        labels = {
+            word["text"].strip().upper()
+            for word in words
+            if word["x0"] < 70 and top - 1 <= word["top"] <= bottom + 1
+        }
+        bands.append({"top": top, "bottom": bottom, "labels": labels})
+    return bands
+
+
+def _band_named(bands, name: str):
+    for band in bands:
+        if name in band["labels"]:
+            return band
+    return None
+
+
+def _dividers(page, band, plan):
+    """The vertical rules that split a band into its segments."""
+    height = band["bottom"] - band["top"]
+    xs = set()
+    for edge in list(page.lines) + list(page.edges):
+        if abs(edge["x1"] - edge["x0"]) >= 2:
+            continue
+        if (edge["bottom"] - edge["top"]) < height * 0.35:
+            continue
+        if edge["top"] < band["top"] - 1 or edge["bottom"] > band["bottom"] + 1:
+            continue
+        xs.add(round(edge["x0"], 1))
+    return sorted(xs)
+
+
+def _segment_bounds(dividers, plan):
+    """Turn divider positions into (x_low, x_high) spans covering the plan."""
+    low, high = plan
+    edges = sorted({round(x, 1) for x in dividers})
+    edges = [x for x in edges if low - 40 <= x <= high + 40]
+    if not edges:
+        return [(low, high)]
+    if edges[0] > low:
+        edges.insert(0, low)
+    if edges[-1] < high:
+        edges.append(high)
+    return list(zip(edges, edges[1:]))
+
+
+def _station_range(anchors, x_low, x_high):
+    a = _station_at(anchors, x_low)
+    b = _station_at(anchors, x_high)
+    if a is None or b is None:
+        return None, None
+    return min(a, b), max(a, b)
+
+
 def _read_title_block(sheet, text, words, page_width, page_height):
+    """Route name, pipeline and sheet numbers off the title block.
+
+    The station range is NOT read here. Real sheets do not always carry a
+    "From X To Y" line, and the axis ticks give a better answer anyway.
+    """
     match = RANGE_RE.search(text)
     if match:
         sheet.station_start = station_to_feet(match.group(1))
         sheet.station_end = station_to_feet(match.group(2))
-    else:
-        # No "From X To Y" in the title block: fall back to the span of the
-        # station labels printed on the sheet. Without a range the sheet can
-        # never be matched to a dig, so a rough range beats none.
-        stations = [
-            station_to_feet(m.group(0)) for m in STATION_RE.finditer(text)
-        ]
-        stations = [value for value in stations if value is not None]
-        if len(stations) >= 2:
-            sheet.station_start, sheet.station_end = min(stations), max(stations)
-            sheet.range_is_inferred = True
 
     match = PIPELINE_RE.search(text)
     if match:
@@ -1347,16 +1556,6 @@ def _read_title_block(sheet, text, words, page_width, page_height):
     match = SHEET_RE.search(text)
     if match:
         sheet.sheet_number = match.group(1)
-
-    match = COUNTY_RE.search(text)
-    if match:
-        words = [
-            word for word in match.group(1).split()
-            if word.upper() != "COUNTY"
-        ]
-        if words:
-            sheet.county = " ".join(words[-2:]).title()
-            sheet.state = _state_abbrev(match.group(2).strip())
 
     sheet.route_name = _find_route_name(text, words, page_width, page_height)
 
@@ -1407,217 +1606,182 @@ def _state_abbrev(name: str) -> str:
     return states.get(name.upper().strip(), name.title())
 
 
-def _station_anchors(words):
-    """Fit station = slope * x + intercept from the station tick labels.
-
-    The ticks along the plan/profile axis are the only station labels that sit
-    on a common horizontal line, so they are found by taking the largest such
-    group and requiring the fit to be monotonic.
-    """
-    ticks = []
-    for word in words:
-        match = STATION_RE.fullmatch(word["text"].strip())
-        if match:
-            ticks.append((
-                (word["x0"] + word["x1"]) / 2.0,
-                word["top"],
-                station_to_feet(word["text"].strip()),
-            ))
-    if len(ticks) < 3:
-        return None
-
-    rows: dict[int, list] = {}
-    for x, top, station in ticks:
-        rows.setdefault(int(round(top / 3.0)), []).append((x, station))
-    best = max(rows.values(), key=len)
-    if len(best) < 3:
-        return None
-
-    best.sort()
-    xs = [point[0] for point in best]
-    ys = [point[1] for point in best]
-    n = len(xs)
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    denominator = sum((x - mean_x) ** 2 for x in xs)
-    if denominator == 0:
-        return None
-    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
-    intercept = mean_y - slope * mean_x
-
-    # Reject a poor fit rather than produce confident nonsense.
-    residuals = [abs(slope * x + intercept - y) for x, y in zip(xs, ys)]
-    span = max(ys) - min(ys)
-    if span == 0 or max(residuals) > span * 0.05:
-        return None
-    return slope, intercept
-
-
-def _station_at(anchors, x) -> Optional[int]:
-    if not anchors:
-        return None
-    slope, intercept = anchors
-    return int(round(slope * x + intercept))
-
-
 NAME_WORD_RE = re.compile(r"[A-Z][A-Z.'\-]*$")
 
 
-def _read_counties(sheet, page, words, anchors) -> None:
-    """Read the county band - centred on the page, below the HCA band.
+def _band_labels(page, band, plan, predicate):
+    """Text items sitting inside a band's plan area, with their centres."""
+    found = []
+    for line in _cluster_lines(
+        [w for w in page.extract_words(keep_blank_chars=False)
+         if band["top"] - 1 <= w["top"] <= band["bottom"] + 1
+         and plan[0] - 40 <= w["x0"] <= plan[1] + 40],
+        tolerance=3.0,
+    ):
+        found.extend(predicate(line))
+    return found
 
-    The sheets also carry a bare "COUNTY" row label down the left edge, and
-    other row labels sit on nearby lines, so the name and state are gathered
-    by walking outwards from the word "COUNTY" within its own visual line and
-    stopping at any gap wide enough to be a column break. A bare label has
-    neither a name before it nor a state after it, so it is never mistaken for
-    the value.
-    """
-    max_gap = 14.0
-    entries = []
 
-    for line in _cluster_lines(words, tolerance=3.0):
+def _read_counties(sheet, page, bands, anchors, plan) -> None:
+    """The county band - one entry per stretch between the band's dividers."""
+    band = _band_named(bands, "COUNTY")
+    if band is None:
+        return
+
+    def counties_in(line):
+        results = []
         for index, word in enumerate(line):
             if word["text"].strip().upper().rstrip(",") != "COUNTY":
                 continue
-
             name_parts, back = [], index - 1
             while back >= 0 and len(name_parts) < 2:
-                candidate = line[back]
-                if line[back + 1]["x0"] - candidate["x1"] > max_gap:
+                if line[back + 1]["x0"] - line[back]["x1"] > 14.0:
                     break
-                text = candidate["text"].strip()
+                text = line[back]["text"].strip()
                 if not NAME_WORD_RE.match(text) or text.upper() == "COUNTY":
                     break
                 name_parts.insert(0, text)
                 back -= 1
             if not name_parts:
                 continue
-
             state_parts, forward = [], index + 1
             while forward < len(line) and len(state_parts) < 2:
-                candidate = line[forward]
-                if candidate["x0"] - line[forward - 1]["x1"] > max_gap:
+                if line[forward]["x0"] - line[forward - 1]["x1"] > 14.0:
                     break
-                text = candidate["text"].strip().rstrip(",")
+                text = line[forward]["text"].strip().rstrip(",")
                 if not NAME_WORD_RE.match(text) or text.upper() == "COUNTY":
                     break
                 state_parts.append(text)
                 forward += 1
             if not state_parts:
                 continue
+            centre = (line[index - len(name_parts)]["x0"]
+                      + line[index + len(state_parts)]["x1"]) / 2.0
+            results.append((centre, " ".join(name_parts), " ".join(state_parts)))
+        return results
 
-            left = line[index - len(name_parts)]["x0"]
-            right = line[index + len(state_parts)]["x1"]
-            centre = (left + right) / 2.0
-            entries.append(CountySegment(
-                county=" ".join(name_parts).title(),
-                state=_state_abbrev(" ".join(state_parts)),
-                x_centre=centre,
-                station_ft=_station_at(anchors, centre),
-            ))
+    entries = _band_labels(page, band, plan, counties_in)
+    if not entries:
+        return
 
-    seen = set()
-    for entry in entries:
-        key = (entry.county, entry.state)
-        if key in seen:
-            continue
-        seen.add(key)
-        sheet.counties.append(entry)
+    spans = _segment_bounds(_dividers(page, band, plan), plan)
+    for centre, name, state in entries:
+        low, high = _matching_span(spans, centre, plan)
+        station_low, station_high = _station_range(anchors, low, high)
+        sheet.counties.append(CountySegment(
+            label=f"{name} County",
+            station_low=station_low,
+            station_high=station_high,
+            county=name.title(),
+            state=_state_abbrev(state),
+        ))
 
     if sheet.counties:
         sheet.county = sheet.counties[0].county
         sheet.state = sheet.counties[0].state
 
 
-def _read_plss(sheet, page, words, anchors):
-    text = page.extract_text() or ""
-    labels = []
-    for match in PLSS_RE.finditer(text):
-        township, ns, rng, ew, section = match.groups()
-        labels.append((
-            f"T {township}{ns.upper()}, R {rng}{ew.upper()}, SEC {section}",
-            section,
-        ))
-    if not labels:
+def _read_plss(sheet, page, bands, anchors, plan) -> None:
+    """The PLSS band - each section runs between the dividers drawn around it."""
+    band = _band_named(bands, "PLSS")
+    if band is None:
         return
 
-    # Locate each label horizontally via its "SEC <n>" token.
-    positions: dict[str, float] = {}
-    for index, word in enumerate(words):
-        if word["text"].upper().strip(",") == "SEC" and index + 1 < len(words):
-            number = words[index + 1]["text"].strip().strip(",")
-            if number.isdigit():
-                positions.setdefault(number, (word["x0"] + words[index + 1]["x1"]) / 2.0)
+    def sections_in(line):
+        results = []
+        text_parts = [(w["x0"], w["x1"], w["text"]) for w in line]
+        joined = " ".join(part[2] for part in text_parts)
+        for match in PLSS_RE.finditer(joined):
+            township, ns, rng, ew, section = match.groups()
+            label = f"T {township}{ns.upper()}, R {rng}{ew.upper()}, SEC {section}"
+            # Locate the label by its "SEC <n>" pair.
+            for index, word in enumerate(line):
+                if word["text"].upper().strip(",") != "SEC":
+                    continue
+                if index + 1 < len(line) and line[index + 1]["text"].strip().strip(",") == section:
+                    centre = (word["x0"] + line[index + 1]["x1"]) / 2.0
+                    results.append((centre, label, section))
+                    break
+        return results
 
+    entries = _band_labels(page, band, plan, sections_in)
+    if not entries:
+        return
+
+    spans = _segment_bounds(_dividers(page, band, plan), plan)
     seen = set()
-    for label, section in labels:
+    for centre, label, section in entries:
         if label in seen:
             continue
         seen.add(label)
-        x_centre = positions.get(section)
+        low, high = _matching_span(spans, centre, plan)
+        station_low, station_high = _station_range(anchors, low, high)
         sheet.plss.append(PlssSegment(
             label=label,
+            station_low=station_low,
+            station_high=station_high,
             section=section,
-            x_centre=x_centre if x_centre is not None else 0.0,
-            station_ft=_station_at(anchors, x_centre) if x_centre is not None else None,
         ))
 
 
-def _read_hca(sheet, page, words, anchors):
-    """Best-effort read of the HCA band.
+def _matching_span(spans, centre, plan):
+    for low, high in spans:
+        if low <= centre <= high:
+            return low, high
+    return plan
 
-    The HCA row is a drawn band, not text, so this looks for filled shapes
-    sitting on the same horizontal line as the 'HCA' row label and converts
-    their x extent into a station range. If the band cannot be located the
-    sheet reports HCA as Unknown rather than No.
+
+def _read_hca(sheet, page, bands, words, anchors, plan) -> None:
+    """The HCA band.
+
+    HCA stretches are drawn as thin horizontal rules on the HCA row, not as
+    filled blocks. When the row is found and carries no rules, the sheet is
+    saying there is no HCA here - which is a reliable "No", not "Unknown".
     """
-    if not anchors:
-        return
-
     label = None
     for word in words:
-        if word["text"].strip().upper() == "HCA" and word["x0"] < page.width * 0.12:
-            if label is None or word["x0"] < label["x0"]:
-                label = word
+        if word["x0"] < 70 and word["text"].strip().upper() == "HCA":
+            label = word
+            break
     if label is None:
         return
 
-    top = label["top"] - (label["bottom"] - label["top"]) * 2.0
-    bottom = label["bottom"] + (label["bottom"] - label["top"]) * 2.0
+    # Strictly within the label's own line: the band's border rules sit just
+    # outside it and span the full width, and counting one of those as an HCA
+    # mark makes the whole sheet look like HCA.
+    top = label["top"]
+    bottom = label["bottom"]
+    plan_width = plan[1] - plan[0]
 
-    shapes = list(page.rects) + list(page.curves)
     ranges = []
-    for shape in shapes:
-        centre_y = (shape["top"] + shape["bottom"]) / 2.0
-        if not (top <= centre_y <= bottom):
+    for edge in list(page.lines) + list(page.edges) + list(page.rects):
+        if abs(edge["bottom"] - edge["top"]) > 1.5:
             continue
-        if shape.get("fill") is False and shape.get("stroke") is False:
+        if not (top <= edge["top"] <= bottom):
             continue
-        width = shape["x1"] - shape["x0"]
-        if width < 2 or width > page.width * 0.95:
+        width = edge["x1"] - edge["x0"]
+        if width < 5 or width > plan_width * 0.98:
             continue
-        low = _station_at(anchors, shape["x0"])
-        high = _station_at(anchors, shape["x1"])
-        if low is None or high is None:
+        if edge["x1"] < plan[0] - 40 or edge["x0"] > plan[1] + 40:
             continue
-        ranges.append((min(low, high), max(low, high)))
+        low, high = _station_range(anchors, edge["x0"], edge["x1"])
+        if low is not None:
+            ranges.append((low, high))
 
-    if ranges:
-        ranges.sort()
-        merged = [list(ranges[0])]
-        for low, high in ranges[1:]:
-            if low <= merged[-1][1] + 1:
-                merged[-1][1] = max(merged[-1][1], high)
-            else:
-                merged.append([low, high])
-        sheet.hca_ranges = [tuple(pair) for pair in merged]
-        sheet.hca_reliable = True
+    sheet.hca_reliable = True
+    if not ranges:
+        sheet.hca_ranges = []
+        return
 
+    ranges.sort()
+    merged = [list(ranges[0])]
+    for low, high in ranges[1:]:
+        if low <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], high)
+        else:
+            merged.append([low, high])
+    sheet.hca_ranges = [tuple(pair) for pair in merged]
 
-# ---------------------------------------------------------------------------
-# Applying sheets to digs
-# ---------------------------------------------------------------------------
 
 def apply_alignment(dig, sheets) -> None:
     """Fill a dig's alignment-derived fields from the uploaded sheets.
@@ -1818,13 +1982,31 @@ def parse_kmz(data: bytes, filename: str = "") -> PipelineData:
     return combined
 
 
+def find_placemark(data: PipelineData, name: str) -> Optional[tuple]:
+    """A placemark by name, e.g. the AGM a dig references."""
+    if not data or not name:
+        return None
+    wanted = re.sub(r"\s+", " ", name).strip().upper()
+    for placemark_name, longitude, latitude in data.placemarks:
+        if re.sub(r"\s+", " ", placemark_name or "").strip().upper() == wanted:
+            return (placemark_name, longitude, latitude)
+    return None
+
+
 def nearest_placemark(data: PipelineData, latitude: float, longitude: float,
-                      max_miles: float = 2.0) -> Optional[tuple]:
-    """The closest named placemark to a point, if one is near enough to label."""
+                      max_miles: float = 2.0, only_agms: bool = True) -> Optional[tuple]:
+    """The closest placemark to a point, if one is near enough to label.
+
+    A dig KMZ usually carries the digs themselves as placemarks alongside the
+    AGMs, so by default only AGM-style names are considered - labelling the
+    dig's own placemark as its AGM reference would be wrong.
+    """
     if not data.placemarks:
         return None
     best, best_distance = None, None
     for name, plon, plat in data.placemarks:
+        if only_agms and not AGM_NAME_RE.match((name or "").strip()):
+            continue
         # Rough local-plane distance in miles; good enough for ranking.
         dx = (plon - longitude) * 54.6
         dy = (plat - latitude) * 69.0
@@ -2180,7 +2362,13 @@ def render_aerial(
 
     agm = None
     if pipeline is not None:
-        agm = nearest_placemark(pipeline, latitude, longitude)
+        # Prefer the AGM this dig actually references, then the nearest AGM.
+        for reference in (dig.downstream_reference, dig.upstream_reference):
+            agm = find_placemark(pipeline, reference)
+            if agm is not None:
+                break
+        if agm is None:
+            agm = nearest_placemark(pipeline, latitude, longitude)
     if agm is not None:
         name, alon, alat = agm
         ax, ay = view.project(alon, alat)
