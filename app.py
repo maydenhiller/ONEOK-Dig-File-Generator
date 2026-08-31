@@ -648,32 +648,266 @@ _HEADER_TOKENS = {
     "flag", "is", "hca", "vendor", "called", "previous",
 }
 
+# Dig names look like NL3DH-24-F1, H64M-26-F11, STSB-24-F1, RJSJ-25-F1.
+DIG_NAME_RE = re.compile(r"\b([A-Z0-9]{2,10}-\d{2}-F\d{1,3})\b")
+
+# Anchored at the start of a cell, and guarded against running into the
+# feature id that follows it ("NL3DH-24-F9" then "40116291").
+DIG_NAME_LEAD_RE = re.compile(r"^([A-Z0-9]{2,10}-\d{2}-F\d{1,3})(?![0-9])")
+
+STATION_TOKEN_RE = re.compile(r"\b\d{1,5}\+\d{2}\b")
+TWO_DP_RE = re.compile(r"\b\d{1,7}\.\d{2}\b")
+ANY_FLOAT_RE = re.compile(r"\b\d{1,7}\.\d{1,3}\b")
+LATLON_TAIL_RE = re.compile(r"(-?\d{1,3}\.\d{4,})\s+(-?\d{1,3}\.\d{4,})\s*$")
+AGM_TOKEN_RE = re.compile(r"\bAGM\s+\d+\b")
+
 
 def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
+    """Find the anomaly row in a PDF dig sheet.
+
+    Three independent signals identify it, in order of confidence:
+
+      1. a value in the Dig Number column,
+      2. the dig name from the heading at the top centre of page one
+         appearing in the row,
+      3. the row sitting inside a yellow highlight band.
+
+    Field values are read out of the row text with anchored patterns rather
+    than by trusting column detection, because the columns are the fragile
+    part: the header wraps over several lines and merges unpredictably.
+    Detected columns are still used to fill anything the patterns miss.
+    """
+    rows, heading, bands, columns = _read_pdf(data)
+
+    # The patterns are authoritative. Column detection is only a gap filler:
+    # a wrongly merged header can leave a column holding an entire row, which
+    # is present but useless, so it must not win over a pattern match.
+    for row in rows:
+        parsed = _parse_row_text(row["_raw"])
+        for key, value in parsed.items():
+            if value:
+                row[key] = value
+
+    anomalies = _select_anomaly_rows(rows, heading, bands)
+    if not anomalies:
+        return []
+
+    ascends = detect_station_ascends(rows)
+    digs = []
+    for row, name in anomalies:
+        row = dict(row)
+        row["dig_number"] = name
+        digs.append(_row_to_dig(row, source_file, ascends))
+    return digs
+
+
+def _read_pdf(data: bytes):
+    """Pull rows, the page-one heading, highlight bands and columns out of a PDF."""
     import pdfplumber
 
     rows: list[dict] = []
+    bands: list[tuple] = []
+    heading = None
+    columns = None
+
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        columns = None
-        for page in pdf.pages:
-            words = page.extract_words(
-                keep_blank_chars=False, use_text_flow=False, extra_attrs=["size"]
-            )
+        for index, page in enumerate(pdf.pages):
+            words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
             if not words:
                 continue
-            page_columns = _detect_pdf_columns(words, page.width)
-            if page_columns:
-                columns = page_columns
-            if not columns:
-                continue
-            rows.extend(_pdf_rows(words, columns))
+            if heading is None:
+                heading = _page_heading_dig_name(page, words)
+            found = _detect_pdf_columns(words, page.width)
+            if found:
+                columns = found
+            for top, bottom in _highlight_bands(page):
+                bands.append((index, top, bottom))
+            rows.extend(_pdf_rows(words, columns, index))
 
-    ascends = detect_station_ascends(rows)
-    return [
-        _row_to_dig(row, source_file, ascends)
-        for row in rows
-        if _clean(row.get("dig_number"))
-    ]
+    return rows, heading, bands, columns
+
+
+def _page_heading_dig_name(page, words) -> Optional[str]:
+    """The dig name printed at the top centre of the first page."""
+    zone = page.height * 0.20
+    centre = page.width / 2.0
+    best, best_distance = None, None
+
+    for word in words:
+        if word["top"] > zone:
+            continue
+        match = DIG_NAME_RE.search(word["text"].replace(" ", "").upper())
+        if not match:
+            continue
+        distance = abs((word["x0"] + word["x1"]) / 2.0 - centre)
+        if best_distance is None or distance < best_distance:
+            best, best_distance = match.group(1), distance
+    if best:
+        return best
+
+    # The name may be split across words; try the top zone joined up.
+    joined = "".join(w["text"] for w in words if w["top"] <= zone).upper()
+    match = DIG_NAME_RE.search(joined)
+    return match.group(1) if match else None
+
+
+def _is_yellowish(colour) -> bool:
+    if not colour:
+        return False
+    try:
+        values = tuple(float(component) for component in colour)
+    except (TypeError, ValueError):
+        return False
+    if len(values) == 3:
+        red, green, blue = values
+        return red > 0.70 and green > 0.60 and blue < 0.60 and abs(red - green) < 0.40
+    if len(values) == 4:
+        cyan, magenta, yellow, black = values
+        return yellow > 0.35 and cyan < 0.35 and magenta < 0.45 and black < 0.35
+    if len(values) == 1:
+        return False
+    return False
+
+
+def _highlight_bands(page) -> list:
+    """Vertical bands covered by yellow fills - the highlighted anomaly row."""
+    raw = []
+    for shape in list(page.rects) + list(page.curves):
+        if shape.get("fill") is False:
+            continue
+        if not _is_yellowish(shape.get("non_stroking_color")):
+            continue
+        height = shape["bottom"] - shape["top"]
+        width = shape["x1"] - shape["x0"]
+        if height <= 0 or height > page.height * 0.12 or width < 3:
+            continue
+        raw.append((shape["top"], shape["bottom"]))
+
+    if not raw:
+        return []
+    raw.sort()
+    merged = [list(raw[0])]
+    for top, bottom in raw[1:]:
+        if top <= merged[-1][1] + 1.5:
+            merged[-1][1] = max(merged[-1][1], bottom)
+        else:
+            merged.append([top, bottom])
+    return [tuple(band) for band in merged]
+
+
+def _select_anomaly_rows(rows, heading, bands) -> list:
+    """Pick the anomaly row(s), preferring the most explicit signal available."""
+    needle = heading.replace(" ", "").upper() if heading else None
+    scored = []
+
+    for row in rows:
+        squashed = row["_raw"].replace(" ", "").upper()
+        name, score = None, 0
+
+        # A value in the Dig Number column: that column is leftmost, so the
+        # row simply begins with the dig name. This does not depend on column
+        # detection, which the wrapped headers make unreliable.
+        lead = _leading_dig_name(row)
+        if lead:
+            name, score = lead, 3
+
+        if name is None and needle and needle in squashed:
+            name, score = heading, 2
+
+        if name is None and _in_band(row, bands):
+            match = DIG_NAME_RE.search(squashed)
+            name = match.group(1) if match else heading
+            score = 1 if name else 0
+
+        if name:
+            scored.append((score, row, name))
+
+    if not scored:
+        return []
+    best = max(score for score, _, _ in scored)
+    return [(row, name) for score, row, name in scored if score == best]
+
+
+def _leading_dig_name(row) -> Optional[str]:
+    """The dig name when the row starts with one, i.e. has a Dig Number."""
+    words = row.get("_lead_words") or []
+    if not words:
+        return None
+    first = words[0].replace(" ", "").upper()
+    match = DIG_NAME_LEAD_RE.match(first)
+    if match:
+        return match.group(1)
+    if len(words) > 1:
+        # The name can be split across two words ("NL3DH-24-" then "F9").
+        joined = (words[0] + words[1]).replace(" ", "").upper()
+        match = DIG_NAME_LEAD_RE.match(joined)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _in_band(row, bands) -> bool:
+    for page_index, top, bottom in bands:
+        if page_index != row.get("_page"):
+            continue
+        if top - 2.0 <= row.get("_top", -1) <= bottom + 2.0:
+            return True
+    return False
+
+
+def _parse_row_text(text: str) -> dict:
+    """Read a row's values straight off its text, anchored on stable landmarks.
+
+    The column order is fixed, so each field can be found relative to something
+    unmistakable: the station is the only ``nnnn+nn`` token, the odometer is the
+    float before it, the weld distances are the last two two-decimal numbers
+    before the first AGM reference, and so on.
+    """
+    out: dict = {}
+    line = " ".join(text.split())
+    if not line:
+        return out
+
+    match = DIG_NAME_RE.search(line.replace(" ", "").upper())
+    if match:
+        out["dig_number_guess"] = match.group(1)
+
+    tail = LATLON_TAIL_RE.search(line)
+    if tail:
+        out["latitude"], out["longitude"] = tail.group(1), tail.group(2)
+
+    station = STATION_TOKEN_RE.search(line)
+    if station:
+        out["station"] = station.group(0)
+        before = line[: station.start()]
+        floats = ANY_FLOAT_RE.findall(before)
+        if floats:
+            out["odometer"] = floats[-1]
+
+    agms = list(AGM_TOKEN_RE.finditer(line))
+    if agms:
+        first = agms[0]
+        preceding = TWO_DP_RE.findall(line[: first.start()])
+        if len(preceding) >= 2:
+            out["us_weld_distance"] = preceding[-2]
+            out["ds_weld_distance"] = preceding[-1]
+        out["us_agm_ref"] = first.group(0)
+
+        if len(agms) >= 2:
+            second = agms[1]
+            between = TWO_DP_RE.findall(line[first.end(): second.start()])
+            if between:
+                out["us_agm_distance"] = between[-1]
+            out["ds_agm_ref"] = second.group(0)
+            after = TWO_DP_RE.findall(line[second.end():])
+            if after:
+                out["ds_agm_distance"] = after[0]
+        else:
+            after = TWO_DP_RE.findall(line[first.end():])
+            if after:
+                out["us_agm_distance"] = after[0]
+
+    return out
 
 
 def _cluster_lines(words, tolerance: float = 2.5):
@@ -689,22 +923,23 @@ def _cluster_lines(words, tolerance: float = 2.5):
     return lines
 
 
+def _looks_like_header(tokens) -> bool:
+    if not tokens:
+        return False
+    hits = sum(1 for token in tokens if token in _HEADER_TOKENS)
+    return hits >= max(3, len(tokens) * 0.6)
+
+
 def _detect_pdf_columns(words, page_width: float):
     """Read column x-boundaries off the wrapped header block.
 
-    The header spans several visual lines ("US Weld" / "Distance"). Words are
-    grouped into header blocks by horizontal overlap, each block's combined
-    text is matched to a canonical column, and boundaries are placed midway
-    between neighbouring blocks.
+    Best effort only - the parser no longer depends on this succeeding.
     """
     lines = _cluster_lines(words)
     header_lines = []
-    for line in lines[:8]:
+    for line in lines[:10]:
         tokens = [w["text"].strip().lower().rstrip(":") for w in line]
-        if not tokens:
-            continue
-        hits = sum(1 for token in tokens if token in _HEADER_TOKENS)
-        if hits >= max(3, len(tokens) * 0.6):
+        if _looks_like_header(tokens):
             header_lines.append(line)
         elif header_lines:
             break
@@ -736,7 +971,7 @@ def _detect_pdf_columns(words, page_width: float):
         block["canonical"] = _canonical(block["text"])
 
     named = [block for block in blocks if block["canonical"]]
-    if len(named) < 6:
+    if len(named) < 4:
         return None
 
     columns = []
@@ -751,27 +986,69 @@ def _detect_pdf_columns(words, page_width: float):
     return columns
 
 
-def _pdf_rows(words, columns):
-    """Turn word clusters into dicts keyed by canonical column name."""
+def _pdf_rows(words, columns, page_index: int):
+    """Turn word clusters into rows, with or without detected columns."""
     rows = []
     for line in _cluster_lines(words):
         tokens = [w["text"].strip().lower().rstrip(":") for w in line]
-        if tokens and sum(1 for t in tokens if t in _HEADER_TOKENS) >= max(3, len(tokens) * 0.6):
-            continue  # a repeated header
-
-        cells: dict[str, list[str]] = {}
-        for word in line:
-            centre = (word["x0"] + word["x1"]) / 2.0
-            for left, right, name in columns:
-                if left <= centre < right:
-                    cells.setdefault(name, []).append(word["text"])
-                    break
-        if not cells:
+        if _looks_like_header(tokens):
             continue
-        row = {name: " ".join(parts).strip() for name, parts in cells.items()}
-        if row.get("odometer") or row.get("station"):
+
+        raw = " ".join(w["text"] for w in line).strip()
+        if not raw:
+            continue
+
+        row: dict = {}
+        if columns:
+            cells: dict[str, list[str]] = {}
+            for word in line:
+                centre = (word["x0"] + word["x1"]) / 2.0
+                for left, right, name in columns:
+                    if left <= centre < right:
+                        cells.setdefault(name, []).append(word["text"])
+                        break
+            row = {name: " ".join(parts).strip() for name, parts in cells.items()}
+
+        row["_raw"] = raw
+        row["_top"] = line[0]["top"]
+        row["_page"] = page_index
+        # The dig name can be split across words, so keep the first two.
+        row["_lead_words"] = [w["text"] for w in line[:2]]
+
+        # A data row is one that carries a station or an odometer.
+        if (
+            row.get("station")
+            or row.get("odometer")
+            or STATION_TOKEN_RE.search(raw)
+        ):
             rows.append(row)
     return rows
+
+
+def pdf_digsheet_report(data: bytes, filename: str) -> dict:
+    """What the parser saw in a PDF, for when it finds nothing."""
+    try:
+        rows, heading, bands, columns = _read_pdf(data)
+    except Exception as error:  # noqa: BLE001
+        return {"file": filename, "error": str(error)}
+
+    samples = []
+    for row in rows[:400]:
+        raw = row["_raw"]
+        if DIG_NAME_RE.search(raw.replace(" ", "").upper()):
+            samples.append(raw[:180])
+        if len(samples) >= 5:
+            break
+
+    return {
+        "file": filename,
+        "heading": heading,
+        "columns": [name for _, _, name in columns] if columns else None,
+        "rows": len(rows),
+        "highlight_bands": len(bands),
+        "rows_containing_a_dig_name": samples,
+        "first_row": rows[0]["_raw"][:180] if rows else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2217,6 +2494,7 @@ if not ready:
 if st.button("Read uploads", type="primary", disabled=not ready):
     digs = []
     problems = []
+    diagnostics = []
 
     with st.status("Reading dig sheets…", expanded=False):
         for upload in dig_files:
@@ -2227,8 +2505,15 @@ if st.button("Read uploads", type="primary", disabled=not ready):
                 continue
             if not found:
                 problems.append(
-                    f"{upload.name}: no row carrying a Dig Number was found."
+                    f"{upload.name}: could not find the anomaly row. Looked for "
+                    "a row starting with the dig name, a row containing the "
+                    "heading from the top of page one, and a yellow highlighted "
+                    "row."
                 )
+                if upload.name.lower().endswith(".pdf"):
+                    diagnostics.append(
+                        pdf_digsheet_report(upload.getvalue(), upload.name)
+                    )
             digs.extend(found)
 
     sheets = []
@@ -2262,6 +2547,15 @@ if st.button("Read uploads", type="primary", disabled=not ready):
 
     for problem in problems:
         st.warning(problem)
+
+    if diagnostics:
+        with st.expander("What the parser saw in those PDFs", expanded=True):
+            st.caption(
+                "Send this to Claude and the parser can be corrected against "
+                "your actual sheet without guessing."
+            )
+            for report in diagnostics:
+                st.json(report)
 
 
 digs = st.session_state.digs or []
