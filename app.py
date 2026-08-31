@@ -688,7 +688,7 @@ def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
             if value:
                 row[key] = value
 
-    anomalies = _select_anomaly_rows(rows, heading, bands)
+    anomalies, _ = _select_anomaly_rows(rows, heading, bands)
     if not anomalies:
         return []
 
@@ -795,37 +795,85 @@ def _highlight_bands(page) -> list:
     return [tuple(band) for band in merged]
 
 
-def _select_anomaly_rows(rows, heading, bands) -> list:
-    """Pick the anomaly row(s), preferring the most explicit signal available."""
+def _select_anomaly_rows(rows, heading, bands):
+    """The anomaly row must satisfy all three conditions at once.
+
+    A dig sheet can carry other highlighted rows that are not the call
+    anomaly, so no single signal is trusted on its own. A row qualifies only
+    when it:
+
+      1. begins with a dig name - that is, has a value in the Dig Number
+         column, which is the leftmost column;
+      2. carries the same dig name as the heading at the top centre of page
+         one; and
+      3. sits inside a yellow highlight band.
+
+    Returns ``(matches, tally)``. The tally records how many rows survived
+    each condition so a failure can say which one eliminated everything
+    rather than just reporting nothing found.
+    """
     needle = heading.replace(" ", "").upper() if heading else None
-    scored = []
+    tally = {
+        "rows": len(rows),
+        "start_with_a_dig_name": 0,
+        "and_match_the_heading": 0,
+        "and_are_highlighted": 0,
+        "heading": heading,
+        "dig_names_seen": [],
+    }
 
+    matches = []
     for row in rows:
-        squashed = row["_raw"].replace(" ", "").upper()
-        name, score = None, 0
-
-        # A value in the Dig Number column: that column is leftmost, so the
-        # row simply begins with the dig name. This does not depend on column
-        # detection, which the wrapped headers make unreliable.
         lead = _leading_dig_name(row)
-        if lead:
-            name, score = lead, 3
+        if not lead:
+            continue
+        tally["start_with_a_dig_name"] += 1
+        if lead not in tally["dig_names_seen"]:
+            tally["dig_names_seen"].append(lead)
 
-        if name is None and needle and needle in squashed:
-            name, score = heading, 2
+        if not needle or lead.replace(" ", "").upper() != needle:
+            continue
+        tally["and_match_the_heading"] += 1
 
-        if name is None and _in_band(row, bands):
-            match = DIG_NAME_RE.search(squashed)
-            name = match.group(1) if match else heading
-            score = 1 if name else 0
+        if not _in_band(row, bands):
+            continue
+        tally["and_are_highlighted"] += 1
 
-        if name:
-            scored.append((score, row, name))
+        matches.append((row, lead))
 
-    if not scored:
-        return []
-    best = max(score for score, _, _ in scored)
-    return [(row, name) for score, row, name in scored if score == best]
+    return matches, tally
+
+
+def _anomaly_failure_reason(tally, bands) -> str:
+    """Say which of the three conditions eliminated every row."""
+    if not tally["rows"]:
+        return "no data rows were found in the PDF at all."
+    if not tally["start_with_a_dig_name"]:
+        return (
+            "no row starts with a dig name, so no row has a value in the "
+            "Dig Number column."
+        )
+    if not tally["heading"]:
+        return (
+            "no dig name was found in the heading at the top centre of page "
+            f"one, though {tally['start_with_a_dig_name']} row(s) carry a Dig "
+            f"Number ({', '.join(tally['dig_names_seen'])})."
+        )
+    if not tally["and_match_the_heading"]:
+        return (
+            f"the heading reads {tally['heading']}, but the Dig Number "
+            f"column holds {', '.join(tally['dig_names_seen'])} - they do "
+            "not match."
+        )
+    if not bands:
+        return (
+            f"the row for {tally['heading']} was found, but no yellow "
+            "highlight was detected anywhere in the PDF."
+        )
+    return (
+        f"the row for {tally['heading']} was found and the PDF has "
+        f"{len(bands)} highlighted band(s), but that row is not inside one."
+    )
 
 
 def _leading_dig_name(row) -> Optional[str]:
@@ -1032,22 +1080,28 @@ def pdf_digsheet_report(data: bytes, filename: str) -> dict:
     except Exception as error:  # noqa: BLE001
         return {"file": filename, "error": str(error)}
 
+    matches, tally = _select_anomaly_rows(rows, heading, bands)
+
     samples = []
     for row in rows[:400]:
-        raw = row["_raw"]
-        if DIG_NAME_RE.search(raw.replace(" ", "").upper()):
-            samples.append(raw[:180])
+        if _leading_dig_name(row):
+            samples.append(row["_raw"][:180])
         if len(samples) >= 5:
             break
 
     return {
         "file": filename,
-        "heading": heading,
-        "columns": [name for _, _, name in columns] if columns else None,
-        "rows": len(rows),
-        "highlight_bands": len(bands),
-        "rows_containing_a_dig_name": samples,
-        "first_row": rows[0]["_raw"][:180] if rows else None,
+        "why_nothing_matched": _anomaly_failure_reason(tally, bands),
+        "heading_at_top_of_page_one": heading,
+        "rows_read": tally["rows"],
+        "1_start_with_a_dig_name": tally["start_with_a_dig_name"],
+        "2_and_match_the_heading": tally["and_match_the_heading"],
+        "3_and_are_highlighted": tally["and_are_highlighted"],
+        "dig_names_in_the_dig_number_column": tally["dig_names_seen"],
+        "highlight_bands_found": len(bands),
+        "columns_detected": [name for _, _, name in columns] if columns else None,
+        "example_rows_with_a_dig_number": samples,
+        "first_data_row": rows[0]["_raw"][:180] if rows else None,
     }
 
 
@@ -2504,15 +2558,16 @@ if st.button("Read uploads", type="primary", disabled=not ready):
                 problems.append(f"{upload.name}: {error}")
                 continue
             if not found:
-                problems.append(
-                    f"{upload.name}: could not find the anomaly row. Looked for "
-                    "a row starting with the dig name, a row containing the "
-                    "heading from the top of page one, and a yellow highlighted "
-                    "row."
-                )
                 if upload.name.lower().endswith(".pdf"):
-                    diagnostics.append(
-                        pdf_digsheet_report(upload.getvalue(), upload.name)
+                    report = pdf_digsheet_report(upload.getvalue(), upload.name)
+                    diagnostics.append(report)
+                    problems.append(
+                        f"{upload.name}: no anomaly row — "
+                        + report.get("why_nothing_matched", "reason unknown.")
+                    )
+                else:
+                    problems.append(
+                        f"{upload.name}: no row carrying a Dig Number was found."
                     )
             digs.extend(found)
 
