@@ -1179,6 +1179,14 @@ ROUTE_RE = re.compile(r"\((\d{4,6}(?:-\d+)?)\)\s*(.+)")
 
 
 @dataclass
+class CountySegment:
+    county: str
+    state: str
+    x_centre: float
+    station_ft: Optional[int] = None
+
+
+@dataclass
 class PlssSegment:
     label: str
     section: str
@@ -1196,6 +1204,7 @@ class AlignmentSheet:
     state: str = UNKNOWN
     station_start: Optional[int] = None
     station_end: Optional[int] = None
+    counties: list = field(default_factory=list)      # list[CountySegment]
     plss: list = field(default_factory=list)          # list[PlssSegment]
     hca_ranges: list = field(default_factory=list)     # list[tuple[int, int]]
     hca_reliable: bool = False
@@ -1230,6 +1239,21 @@ class AlignmentSheet:
             return False
         low, high = sorted((self.station_start, self.station_end))
         return low <= station_ft <= high
+
+    def county_for(self, station_ft: Optional[int]) -> Optional[CountySegment]:
+        """The county band entry covering this station.
+
+        A sheet can cross a county line, so the entries are placed by their
+        position along the stationing axis, the same as the PLSS band.
+        """
+        if not self.counties:
+            return None
+        if len(self.counties) == 1:
+            return self.counties[0]
+        located = [c for c in self.counties if c.station_ft is not None]
+        if not located or station_ft is None:
+            return self.counties[0]
+        return min(located, key=lambda c: abs(c.station_ft - station_ft))
 
     def plss_for(self, station_ft: Optional[int]) -> Optional[PlssSegment]:
         """The PLSS block whose stretch of the sheet contains this station."""
@@ -1268,6 +1292,7 @@ def parse_alignment_sheet(data: bytes, filename: str) -> AlignmentSheet:
 
         _read_title_block(sheet, text, words, page.width, page.height)
         anchors = _station_anchors(words)
+        _read_counties(sheet, page, words, anchors)
         _read_plss(sheet, page, words, anchors)
         _read_hca(sheet, page, words, anchors)
 
@@ -1404,6 +1429,76 @@ def _station_at(anchors, x) -> Optional[int]:
     return int(round(slope * x + intercept))
 
 
+NAME_WORD_RE = re.compile(r"[A-Z][A-Z.'\-]*$")
+
+
+def _read_counties(sheet, page, words, anchors) -> None:
+    """Read the county band - centred on the page, below the HCA band.
+
+    The sheets also carry a bare "COUNTY" row label down the left edge, and
+    other row labels sit on nearby lines, so the name and state are gathered
+    by walking outwards from the word "COUNTY" within its own visual line and
+    stopping at any gap wide enough to be a column break. A bare label has
+    neither a name before it nor a state after it, so it is never mistaken for
+    the value.
+    """
+    max_gap = 14.0
+    entries = []
+
+    for line in _cluster_lines(words, tolerance=3.0):
+        for index, word in enumerate(line):
+            if word["text"].strip().upper().rstrip(",") != "COUNTY":
+                continue
+
+            name_parts, back = [], index - 1
+            while back >= 0 and len(name_parts) < 2:
+                candidate = line[back]
+                if line[back + 1]["x0"] - candidate["x1"] > max_gap:
+                    break
+                text = candidate["text"].strip()
+                if not NAME_WORD_RE.match(text) or text.upper() == "COUNTY":
+                    break
+                name_parts.insert(0, text)
+                back -= 1
+            if not name_parts:
+                continue
+
+            state_parts, forward = [], index + 1
+            while forward < len(line) and len(state_parts) < 2:
+                candidate = line[forward]
+                if candidate["x0"] - line[forward - 1]["x1"] > max_gap:
+                    break
+                text = candidate["text"].strip().rstrip(",")
+                if not NAME_WORD_RE.match(text) or text.upper() == "COUNTY":
+                    break
+                state_parts.append(text)
+                forward += 1
+            if not state_parts:
+                continue
+
+            left = line[index - len(name_parts)]["x0"]
+            right = line[index + len(state_parts)]["x1"]
+            centre = (left + right) / 2.0
+            entries.append(CountySegment(
+                county=" ".join(name_parts).title(),
+                state=_state_abbrev(" ".join(state_parts)),
+                x_centre=centre,
+                station_ft=_station_at(anchors, centre),
+            ))
+
+    seen = set()
+    for entry in entries:
+        key = (entry.county, entry.state)
+        if key in seen:
+            continue
+        seen.add(key)
+        sheet.counties.append(entry)
+
+    if sheet.counties:
+        sheet.county = sheet.counties[0].county
+        sheet.state = sheet.counties[0].state
+
+
 def _read_plss(sheet, page, words, anchors):
     text = page.extract_text() or ""
     labels = []
@@ -1526,10 +1621,14 @@ def apply_alignment(dig, sheets) -> None:
     if sheet.route_name != UNKNOWN:
         dig.line_name = sheet.route_name
     dig.alignment_sheet = sheet.sheet_id
-    if sheet.county != UNKNOWN:
-        dig.county = sheet.county
-    if sheet.state != UNKNOWN:
-        dig.state = sheet.state
+    county = sheet.county_for(dig.station_ft)
+    if county is not None:
+        dig.county, dig.state = county.county, county.state
+    else:
+        if sheet.county != UNKNOWN:
+            dig.county = sheet.county
+        if sheet.state != UNKNOWN:
+            dig.state = sheet.state
 
     segment = sheet.plss_for(dig.station_ft)
     if segment is not None:
