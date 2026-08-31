@@ -1893,7 +1893,6 @@ COL_LON = 10        # J
 def build_cheat_sheet(
     template_bytes: bytes,
     digs: Iterable[Dig],
-    coordinates: str = "ili",       # "ili" | "na" | "blank"
     auto_notes: bool = True,
     proximity_feet: float = 2000.0,
 ) -> bytes:
@@ -1945,13 +1944,12 @@ def build_cheat_sheet(
 
         sheet.cell(anomaly, COL_HCA).value = None if dig.hca == UNKNOWN else dig.hca
 
+        # Latitude and longitude are field measurements. They are always left
+        # blank for manual entry, and actively cleared so that a template that
+        # already carries values in those columns cannot leak them through.
         for row in (top, anomaly, bottom):
-            if coordinates == "na":
-                sheet.cell(row, COL_LAT).value = "N/A"
-                sheet.cell(row, COL_LON).value = "N/A"
-            elif coordinates == "ili" and row == anomaly:
-                sheet.cell(row, COL_LAT).value = dig.ili_latitude
-                sheet.cell(row, COL_LON).value = dig.ili_longitude
+            sheet.cell(row, COL_LAT).value = None
+            sheet.cell(row, COL_LON).value = None
 
         previous = dig
 
@@ -2001,7 +1999,6 @@ DEFAULT_STAKING_NOTES = (
 @dataclass
 class ReportSettings:
     surveyor_name: str = ""
-    surveyor_phone: str = ""
     tool_type: str = DEFAULT_TOOL_TYPE
     staking_notes: str = DEFAULT_STAKING_NOTES
     write_line_name: bool = True
@@ -2056,9 +2053,10 @@ def build_staking_report(
         if dig.state and dig.state != UNKNOWN:
             values["C23"] = dig.state
     if settings.surveyor_name:
+        # C11 only. The phone number in C12 is an XLOOKUP against the template's
+        # own employee table, keyed off this name - writing C12 would replace
+        # that formula with a static value.
         values["C11"] = settings.surveyor_name
-    if settings.surveyor_phone:
-        values["C12"] = settings.surveyor_phone
 
     missing = patcher.set_values(SHEET, values)
     if missing:
@@ -2138,8 +2136,11 @@ def mapbox_token() -> str:
 token = mapbox_token()
 
 st.sidebar.header("Report details")
-surveyor_name = st.sidebar.text_input("Surveyed by", value="")
-surveyor_phone = st.sidebar.text_input("Phone number", value="")
+surveyor_name = st.sidebar.text_input(
+    "Surveyed by",
+    value="",
+    help="The phone number fills itself in from the template's employee table.",
+)
 tool_type = st.sidebar.text_input("Tool type", value=DEFAULT_TOOL_TYPE)
 staking_notes = st.sidebar.text_area("Staking notes", value=DEFAULT_STAKING_NOTES, height=110)
 
@@ -2162,18 +2163,7 @@ if not token:
     st.sidebar.caption("No Mapbox token found — directions will be left blank.")
 
 st.sidebar.header("Cheat sheet")
-coordinate_mode = st.sidebar.radio(
-    "Latitude / longitude columns",
-    ["ILI coordinates from the dig sheet", "N/A", "Leave blank"],
-    index=0,
-)
 auto_notes = st.sidebar.checkbox("Auto-note digs close to the previous one", value=True)
-
-COORD_MODES = {
-    "ILI coordinates from the dig sheet": "ili",
-    "N/A": "na",
-    "Leave blank": "blank",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -2183,7 +2173,8 @@ COORD_MODES = {
 st.title("ONEOK Dig File Generator")
 st.caption(
     "Fills the staking report and cheat sheet from your dig sheets. "
-    "Latitude, longitude, elevation, DOC, survey date and photos stay manual."
+    "Latitude, longitude, elevation, EDOC, survey date and photos are field "
+    "measurements and are always left blank."
 )
 
 col_left, col_right = st.columns(2)
@@ -2346,7 +2337,6 @@ if digs:
 
         settings = ReportSettings(
             surveyor_name=surveyor_name,
-            surveyor_phone=surveyor_phone,
             tool_type=tool_type,
             staking_notes=staking_notes,
         )
@@ -2401,7 +2391,6 @@ if digs:
             outputs["Dig Stake Cheat Sheet.xlsx"] = build_cheat_sheet(
                 cheat_bytes,
                 digs,
-                coordinates=COORD_MODES[coordinate_mode],
                 auto_notes=auto_notes,
             )
         except Exception as error:  # noqa: BLE001
