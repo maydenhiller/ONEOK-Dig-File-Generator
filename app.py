@@ -355,6 +355,31 @@ class XlsmPatcher:
             return None
         return _resolve(path, match.group(1))
 
+    def force_full_recalc(self) -> None:
+        """Make Excel recalculate every formula when the file is opened.
+
+        Formula cells carry the value Excel last computed. The template's
+        phone number is an XLOOKUP against the surveyor name with a stale
+        cached result, so without this the report opens showing the old value
+        until something nudges the cell.
+        """
+        path = "xl/workbook.xml"
+        if path not in self.parts:
+            return
+        xml = self._text(path)
+        match = re.search(r"<calcPr\b[^>]*/?>", xml)
+        if match:
+            tag = match.group(0)
+            if "fullCalcOnLoad" in tag:
+                return
+            updated = tag.rstrip("/>").rstrip() + ' fullCalcOnLoad="1"/>'
+            xml = xml[: match.start()] + updated + xml[match.end():]
+        else:
+            xml = xml.replace(
+                "</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>'
+            )
+        self.parts[path] = xml.encode("utf-8")
+
     # -- output ---------------------------------------------------------
     def to_bytes(self) -> bytes:
         buffer = io.BytesIO()
@@ -2201,30 +2226,34 @@ def _centred_text(draw, centre, text, font, **kwargs):
     )
 
 
-def _draw_pin(draw, x, y, colour=(255, 214, 0)):
+def _draw_pin(draw, x, y, scale=1.0, colour=(255, 214, 0)):
     """A small Google Earth style pushpin."""
-    height = 22
-    radius = 7
-    draw.line([(x, y), (x, y - height + radius)], fill=(60, 60, 60), width=3)
+    height = 22 * scale
+    radius = 7 * scale
+    draw.line([(x, y), (x, y - height + radius)], fill=(60, 60, 60),
+              width=max(2, int(3 * scale)))
     draw.ellipse(
         [x - radius, y - height, x + radius, y - height + 2 * radius],
         fill=colour,
         outline=(60, 60, 60),
-        width=2,
+        width=max(1, int(2 * scale)),
     )
 
 
-def _draw_flag(draw, x, y, colour=PIPE_RED):
+def _draw_flag(draw, x, y, scale=1.0, colour=PIPE_RED):
     """A small flag marker, used for AGMs."""
-    height = 24
-    draw.line([(x, y), (x, y - height)], fill=(245, 245, 245), width=3)
+    height = 24 * scale
+    draw.line([(x, y), (x, y - height)], fill=(245, 245, 245),
+              width=max(2, int(3 * scale)))
     draw.polygon(
-        [(x + 1, y - height), (x + 16, y - height + 6), (x + 1, y - height + 12)],
+        [(x + scale, y - height),
+         (x + 16 * scale, y - height + 6 * scale),
+         (x + scale, y - height + 12 * scale)],
         fill=colour,
     )
 
 
-def _scale_bar(draw, view, width, height):
+def _scale_bar(draw, view, width, height, scale=1.0):
     mpp = metres_per_pixel(view.centre_lat, view.zoom, view.tile_size)
     feet_per_pixel = mpp * 3.28084
     for target in (200, 400, 500, 800, 1000, 1500, 2000, 3000, 5000):
@@ -2234,64 +2263,81 @@ def _scale_bar(draw, view, width, height):
     else:
         target, pixels = 400, 400 / feet_per_pixel
 
-    right = width - 62
+    right = width - int(62 * scale)
     left = right - pixels
-    baseline = height - 18
-    draw.line([(left, baseline), (right, baseline)], fill=LABEL_WHITE, width=3)
-    draw.line([(left, baseline - 6), (left, baseline + 4)], fill=LABEL_WHITE, width=3)
-    draw.line([(right, baseline - 6), (right, baseline + 4)], fill=LABEL_WHITE, width=3)
-    font = _font(15)
-    _outlined_text(draw, (left, baseline - 24), f"{target:,} ft", font, weight=1)
+    baseline = height - int(18 * scale)
+    thickness = max(2, int(3 * scale))
+    tick = 6 * scale
+    draw.line([(left, baseline), (right, baseline)], fill=LABEL_WHITE, width=thickness)
+    draw.line([(left, baseline - tick), (left, baseline + tick * 0.7)],
+              fill=LABEL_WHITE, width=thickness)
+    draw.line([(right, baseline - tick), (right, baseline + tick * 0.7)],
+              fill=LABEL_WHITE, width=thickness)
+    font = _font(int(15 * scale))
+    _outlined_text(draw, (left, baseline - 26 * scale), f"{target:,} ft", font,
+                   weight=max(1, int(scale)))
 
 
-def _north_arrow(draw, width, height):
-    font = _font(20)
-    x = width - 28
-    y = height - 62
+def _north_arrow(draw, width, height, scale=1.0):
+    font = _font(int(20 * scale))
+    x = width - 28 * scale
+    y = height - 62 * scale
     draw.polygon(
-        [(x, y), (x - 8, y + 22), (x, y + 16), (x + 8, y + 22)],
+        [(x, y), (x - 8 * scale, y + 22 * scale),
+         (x, y + 16 * scale), (x + 8 * scale, y + 22 * scale)],
         fill=LABEL_WHITE,
         outline=SHADOW,
     )
-    _centred_text(draw, (x, y + 36), "N", font, weight=1)
+    _centred_text(draw, (x, y + 38 * scale), "N", font, weight=max(1, int(scale)))
 
 
-def _legend(draw, entries, width):
+def _legend(draw, entries, width, scale=1.0):
     if not entries:
         return
-    font = _font(15)
-    title_font = _font(16)
-    line_height = 20
-    box_width = 190
+    font = _font(int(15 * scale))
+    title_font = _font(int(16 * scale))
+    line_height = 21 * scale
+    box_width = 190 * scale
     for label in entries:
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-        box_width = max(box_width, int(right - left) + 46)
-    box_height = 26 + line_height * len(entries)
-    x0 = width - box_width - 14
-    y0 = 12
+        box_width = max(box_width, (right - left) + 46 * scale)
+    box_height = 28 * scale + line_height * len(entries)
+    x0 = width - box_width - 14 * scale
+    y0 = 12 * scale
 
     draw.rectangle(
         [x0, y0, x0 + box_width, y0 + box_height],
         fill=(255, 255, 255, 235),
         outline=(120, 120, 120),
+        width=max(1, int(scale)),
     )
-    draw.text((x0 + 10, y0 + 5), "Legend", font=title_font, fill=(20, 20, 20))
+    draw.text((x0 + 10 * scale, y0 + 5 * scale), "Legend", font=title_font,
+              fill=(20, 20, 20))
     for index, label in enumerate(entries):
-        y = y0 + 26 + index * line_height
-        draw.text((x0 + 30, y), label, font=font, fill=(20, 20, 20))
-        draw.ellipse([x0 + 13, y + 5, x0 + 21, y + 13], fill=PIPE_RED)
+        y = y0 + 28 * scale + index * line_height
+        draw.text((x0 + 30 * scale, y), label, font=font, fill=(20, 20, 20))
+        radius = 4 * scale
+        centre_y = y + line_height * 0.42
+        draw.ellipse([x0 + 15 * scale - radius, centre_y - radius,
+                      x0 + 15 * scale + radius, centre_y + radius], fill=PIPE_RED)
 
 
-def _title_card(draw, text):
+def _title_card(draw, text, scale=1.0):
     if not text:
         return
-    font = _font(18)
+    font = _font(int(18 * scale))
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-    width = int(right - left) + 24
-    height = int(bottom - top) + 20
-    draw.rectangle([10, 10, 10 + width, 10 + height], fill=(255, 255, 255, 235),
-                   outline=(120, 120, 120))
-    draw.text((22, 18), text, font=font, fill=(20, 20, 20))
+    pad_x = 12 * scale
+    pad_y = 9 * scale
+    x0 = 12 * scale
+    y0 = 12 * scale
+    box_width = (right - left) + pad_x * 2
+    box_height = (bottom - top) + pad_y * 2
+    draw.rectangle([x0, y0, x0 + box_width, y0 + box_height],
+                   fill=(255, 255, 255, 235), outline=(120, 120, 120),
+                   width=max(1, int(scale)))
+    draw.text((x0 + pad_x - left, y0 + pad_y - top), text, font=font,
+              fill=(20, 20, 20))
 
 
 # ---------------------------------------------------------------------------
@@ -2310,12 +2356,23 @@ def render_aerial(
     span_feet: float = 2600.0,
     show_legend: bool = True,
     token: str = "",
+    slot_aspect: Optional[float] = None,
 ) -> Optional[bytes]:
-    """Return PNG bytes for one dig, or None when there is no coordinate."""
+    """Return PNG bytes for one dig, or None when there is no coordinate.
+
+    ``slot_aspect`` is the aspect of the image placeholder in the staking
+    report template. Rendering to it exactly means the image is never cropped
+    to fit, which is what used to clip the title card in the corner.
+    """
     if dig.ili_latitude is None or dig.ili_longitude is None:
         return None
 
-    height = int(round(width / SLOT_ASPECT))
+    aspect = slot_aspect or SLOT_ASPECT
+    height = int(round(width / aspect))
+
+    # Excel shrinks the image into a slot roughly 650 px wide, so everything
+    # drawn on it has to be sized for that, not for the rendered pixels.
+    scale = width / 640.0
     latitude = float(dig.ili_latitude)
     longitude = float(dig.ili_longitude)
 
@@ -2373,24 +2430,27 @@ def render_aerial(
         name, alon, alat = agm
         ax, ay = view.project(alon, alat)
         if -50 <= ax <= width + 50 and -50 <= ay <= height + 50:
-            _draw_flag(draw, ax, ay)
-            _outlined_text(draw, (ax + 20, ay - 34), name or "AGM", _font(17))
+            _draw_flag(draw, ax, ay, scale)
+            _outlined_text(draw, (ax + 20 * scale, ay - 36 * scale),
+                           name or "AGM", _font(int(17 * scale)),
+                           weight=max(1, int(2 * scale)))
             if name:
                 legend_entries.append(name)
         else:
             agm = None
 
     dx, dy = view.project(longitude, latitude)
-    _draw_pin(draw, dx, dy)
-    _centred_text(draw, (dx, dy + 26), dig.name, _font(30))
+    _draw_pin(draw, dx, dy, scale)
+    _centred_text(draw, (dx, dy + 28 * scale), dig.name,
+                  _font(int(26 * scale)), weight=max(2, int(2.5 * scale)))
     if dig.name:
         legend_entries.append(dig.name)
 
     if show_legend:
-        _legend(draw, legend_entries, width)
-    _title_card(draw, dig.name)
-    _scale_bar(draw, view, width, height)
-    _north_arrow(draw, width, height)
+        _legend(draw, legend_entries, width, scale)
+    _title_card(draw, dig.name, scale)
+    _scale_bar(draw, view, width, height, scale)
+    _north_arrow(draw, width, height, scale)
 
     image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
@@ -2838,6 +2898,8 @@ def build_staking_report(
             "Could not place these cells in the template: " + ", ".join(sorted(missing))
         )
 
+    patcher.force_full_recalc()
+
     if dig.aerial_png:
         slot = patcher.find_image_slot(SHEET)
         if slot is None:
@@ -2849,6 +2911,20 @@ def build_staking_report(
             patcher.replace_image(slot, _encode_for_slot(dig.aerial_png, slot))
 
     return patcher.to_bytes(), warnings
+
+
+def template_image_aspect(template_bytes: bytes) -> Optional[float]:
+    """The aspect of the image slot in this template.
+
+    Templates differ, so the aerial is rendered to the slot actually present
+    rather than to a constant - otherwise the image is cropped to fit and the
+    title card in its corner gets clipped.
+    """
+    try:
+        slot = XlsmPatcher(template_bytes).find_image_slot(SHEET)
+    except Exception:  # noqa: BLE001
+        return None
+    return slot.aspect if slot else None
 
 
 def _numeric_if_possible(value):
@@ -3152,6 +3228,7 @@ if digs:
 
         template_bytes = template_file.getvalue()
         cheat_bytes = cheat_file.getvalue()
+        slot_aspect = template_image_aspect(template_bytes)
         pipeline = st.session_state.pipeline
         outputs = {}
         issues = []
@@ -3170,6 +3247,7 @@ if digs:
                         basemap=basemap,
                         span_feet=float(span_feet),
                         token=token,
+                        slot_aspect=slot_aspect,
                     )
                     if dig.aerial_png is None and dig.ili_latitude is not None:
                         issues.append(f"{dig.name}: aerial image could not be rendered.")
