@@ -660,6 +660,9 @@ TWO_DP_RE = re.compile(r"\b\d{1,7}\.\d{2}\b")
 ANY_FLOAT_RE = re.compile(r"\b\d{1,7}\.\d{1,3}\b")
 LATLON_TAIL_RE = re.compile(r"(-?\d{1,3}\.\d{4,})\s+(-?\d{1,3}\.\d{4,})\s*$")
 AGM_TOKEN_RE = re.compile(r"\bAGM\s+\d+\b")
+# Both reference cells carry a station, whether they name an AGM, a launch or
+# receive valve, or anything else. "Sta." is the reliable anchor; "AGM" is not.
+STA_ANCHOR_RE = re.compile(r"\bSta\.")
 
 
 def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
@@ -932,30 +935,61 @@ def _parse_row_text(text: str) -> dict:
         if floats:
             out["odometer"] = floats[-1]
 
-    agms = list(AGM_TOKEN_RE.finditer(line))
-    if agms:
-        first = agms[0]
-        preceding = TWO_DP_RE.findall(line[: first.start()])
-        if len(preceding) >= 2:
-            out["us_weld_distance"] = preceding[-2]
-            out["ds_weld_distance"] = preceding[-1]
-        out["us_agm_ref"] = first.group(0)
-
-        if len(agms) >= 2:
-            second = agms[1]
-            between = TWO_DP_RE.findall(line[first.end(): second.start()])
-            if between:
-                out["us_agm_distance"] = between[-1]
-            out["ds_agm_ref"] = second.group(0)
-            after = TWO_DP_RE.findall(line[second.end():])
-            if after:
-                out["ds_agm_distance"] = after[0]
-        else:
-            after = TWO_DP_RE.findall(line[first.end():])
-            if after:
-                out["us_agm_distance"] = after[0]
+    _read_references(line, out)
 
     return out
+
+
+def _read_references(line: str, out: dict) -> None:
+    """Read the two reference cells and the distances that follow them.
+
+    Column order is: ... US Weld Distance, DS Weld Distance, US AGM Ref,
+    US AGM Distance, DS AGM Ref, DS AGM Distance, ...
+
+    The references are free text and are not always an AGM - an upstream
+    reference is often "Launch Valve", a downstream one "Receive Valve". What
+    they do share is a station, so "Sta." anchors each one, and the distance
+    that closes a reference is the first two-decimal number after it.
+    """
+    numbers = [(m.start(), m.end(), m.group(0)) for m in TWO_DP_RE.finditer(line)]
+    anchors = [m.start() for m in STA_ANCHOR_RE.finditer(line)]
+
+    if len(anchors) < 2:
+        # Fall back to naming AGMs directly, but only when both are AGMs -
+        # guessing which side a lone AGM belongs to is how the wrong
+        # reference ends up on a report.
+        agms = list(AGM_TOKEN_RE.finditer(line))
+        if len(agms) >= 2:
+            anchors = [agms[0].start(), agms[1].start()]
+        else:
+            return
+
+    first, second = anchors[0], anchors[1]
+
+    before = [n for n in numbers if n[1] <= first]
+    after_first = [n for n in numbers if n[0] > first]
+    if not after_first:
+        return
+
+    # The two numbers before the first reference are the weld distances.
+    if len(before) >= 2:
+        out["us_weld_distance"] = before[-2][2]
+        out["ds_weld_distance"] = before[-1][2]
+
+    us_start, us_end, us_value = after_first[0]
+    out["us_agm_distance"] = us_value
+    reference_start = before[-1][1] if before else 0
+    reference = line[reference_start:us_start].strip(" ,")
+    if reference:
+        out["us_agm_ref"] = reference
+
+    after_second = [n for n in numbers if n[0] > second and n[0] >= us_end]
+    if after_second:
+        ds_start, _, ds_value = after_second[0]
+        out["ds_agm_distance"] = ds_value
+        reference = line[us_end:ds_start].strip(" ,")
+        if reference:
+            out["ds_agm_ref"] = reference
 
 
 def _cluster_lines(words, tolerance: float = 2.5):
@@ -1136,7 +1170,10 @@ STATION_RE = re.compile(r"\b(\d{1,5})\+(\d{2})\b")
 RANGE_RE = re.compile(r"From\s+(\d{1,5}\+\d{2})\s+To\s+(\d{1,5}\+\d{2})", re.I)
 PIPELINE_RE = re.compile(r"Pipeline\s+Number:?\s*(\d+)", re.I)
 SHEET_RE = re.compile(r"Sheet\s+(\d+)\s+of\s+(\d+)", re.I)
-COUNTY_RE = re.compile(r"([A-Z][A-Z .'\-]+?)\s+COUNTY,\s*([A-Z][A-Z ]+)")
+COUNTY_RE = re.compile(r"([A-Z][A-Z .'\-]{1,30}?)\s+COUNTY\b\s*,\s*([A-Z][A-Z ]+)")
+# The sheets carry a "COUNTY" row label as well as the county name, and the two
+# can extract onto one line.
+FILENAME_SHEET_RE = re.compile(r"(\d{4,6})[_\-](\d{1,3})\b")
 PLSS_RE = re.compile(r"T\s*(\d+)\s*([NS])\s*,\s*R\s*(\d+)\s*([EW])\s*,\s*SEC\s*(\d+)", re.I)
 ROUTE_RE = re.compile(r"\((\d{4,6}(?:-\d+)?)\)\s*(.+)")
 
@@ -1162,16 +1199,31 @@ class AlignmentSheet:
     plss: list = field(default_factory=list)          # list[PlssSegment]
     hca_ranges: list = field(default_factory=list)     # list[tuple[int, int]]
     hca_reliable: bool = False
+    range_is_inferred: bool = False
 
     @property
     def sheet_id(self) -> str:
-        """The value written into 'Alignment Sheet:' - e.g. 10222_53."""
-        if self.pipeline_number == UNKNOWN or self.sheet_number == UNKNOWN:
-            stem = self.filename.rsplit("/", 1)[-1]
-            stem = re.sub(r"\.pdf$", "", stem, flags=re.I)
-            stem = re.sub(r"\s*alignment\s*sheet\s*", "", stem, flags=re.I).strip()
-            return stem or UNKNOWN
-        return f"{self.pipeline_number}_{self.sheet_number}"
+        """The value written into 'Alignment Sheet:' - e.g. 10222_41.
+
+        The filename is preferred: it already carries the form used on the
+        reports, whereas the sheet prints a zero-padded number ("Sheet 041").
+        """
+        stem = self.filename.rsplit("/", 1)[-1]
+        stem = re.sub(r"\.pdf$", "", stem, flags=re.I)
+        match = FILENAME_SHEET_RE.search(stem)
+        if match:
+            return f"{match.group(1)}_{match.group(2)}"
+        if self.pipeline_number != UNKNOWN and self.sheet_number != UNKNOWN:
+            return f"{self.pipeline_number}_{self.sheet_number}"
+        stem = re.sub(r"\s*alignment\s*sheet\s*", "", stem, flags=re.I).strip()
+        return stem or UNKNOWN
+
+    def describe(self) -> str:
+        if self.station_start is None:
+            return f"{self.sheet_id} (no station range found)"
+        low, high = sorted((self.station_start, self.station_end))
+        suffix = " approx" if self.range_is_inferred else ""
+        return f"{self.sheet_id} {feet_to_station(low)}-{feet_to_station(high)}{suffix}"
 
     def covers(self, station_ft: Optional[int]) -> bool:
         if station_ft is None or self.station_start is None or self.station_end is None:
@@ -1225,9 +1277,19 @@ def parse_alignment_sheet(data: bytes, filename: str) -> AlignmentSheet:
 def _read_title_block(sheet, text, words, page_width, page_height):
     match = RANGE_RE.search(text)
     if match:
-        start = station_to_feet(match.group(1))
-        end = station_to_feet(match.group(2))
-        sheet.station_start, sheet.station_end = start, end
+        sheet.station_start = station_to_feet(match.group(1))
+        sheet.station_end = station_to_feet(match.group(2))
+    else:
+        # No "From X To Y" in the title block: fall back to the span of the
+        # station labels printed on the sheet. Without a range the sheet can
+        # never be matched to a dig, so a rough range beats none.
+        stations = [
+            station_to_feet(m.group(0)) for m in STATION_RE.finditer(text)
+        ]
+        stations = [value for value in stations if value is not None]
+        if len(stations) >= 2:
+            sheet.station_start, sheet.station_end = min(stations), max(stations)
+            sheet.range_is_inferred = True
 
     match = PIPELINE_RE.search(text)
     if match:
@@ -1239,8 +1301,13 @@ def _read_title_block(sheet, text, words, page_width, page_height):
 
     match = COUNTY_RE.search(text)
     if match:
-        sheet.county = match.group(1).strip().title()
-        sheet.state = _state_abbrev(match.group(2).strip())
+        words = [
+            word for word in match.group(1).split()
+            if word.upper() != "COUNTY"
+        ]
+        if words:
+            sheet.county = " ".join(words[-2:]).title()
+            sheet.state = _state_abbrev(match.group(2).strip())
 
     sheet.route_name = _find_route_name(text, words, page_width, page_height)
 
@@ -1430,14 +1497,29 @@ def apply_alignment(dig, sheets) -> None:
     """Fill a dig's alignment-derived fields from the best matching sheet."""
     matches = [sheet for sheet in sheets if sheet.covers(dig.station_ft)]
     if not matches:
-        if len(sheets) == 1:
+        if len(sheets) == 1 and sheets[0].station_start is None:
+            # One sheet whose range could not be read: use it rather than
+            # leaving everything blank, but say so.
             matches = list(sheets)
+            dig.warnings.append(
+                f"Could not read a station range from {sheets[0].sheet_id}, "
+                "so it was used anyway. Check the tract, legal description "
+                "and HCA."
+            )
+        elif sheets:
+            dig.warnings.append(
+                f"No alignment sheet covers station "
+                f"{feet_to_station(dig.station_ft)}. Sheets read: "
+                + "; ".join(sheet.describe() for sheet in sheets)
+                + ". Line name, alignment sheet, tract, legal description "
+                "and HCA left as Unknown."
+            )
+            return
         else:
-            if sheets:
-                dig.warnings.append(
-                    f"No alignment sheet covers station {dig.station_ft}; "
-                    "HCA, tract and legal description left as Unknown."
-                )
+            dig.warnings.append(
+                "No alignment sheets were uploaded, so line name, alignment "
+                "sheet, tract, legal description and HCA are Unknown."
+            )
             return
 
     sheet = matches[0]
@@ -2473,6 +2555,18 @@ surveyor_name = st.sidebar.text_input(
     help="The phone number fills itself in from the template's employee table.",
 )
 tool_type = st.sidebar.text_input("Tool type", value=DEFAULT_TOOL_TYPE)
+county_entry = st.sidebar.text_input(
+    "County",
+    value="",
+    help="Applied to every dig in the batch. Leave blank to use whatever the "
+         "alignment sheet says.",
+)
+state_entry = st.sidebar.text_input(
+    "State",
+    value="",
+    help="Applied to every dig in the batch. Leave blank to use whatever the "
+         "alignment sheet says.",
+)
 staking_notes = st.sidebar.text_area("Staking notes", value=DEFAULT_STAKING_NOTES, height=110)
 
 st.sidebar.header("Aerial image")
@@ -2583,6 +2677,11 @@ if st.button("Read uploads", type="primary", disabled=not ready):
     for dig in digs:
         apply_alignment(dig, sheets)
         dig.staking_notes = staking_notes
+        # Typed values win over anything read off an alignment sheet.
+        if county_entry.strip():
+            dig.county = county_entry.strip()
+        if state_entry.strip():
+            dig.state = state_entry.strip()
 
     pipeline = None
     if kmz_file is not None:
