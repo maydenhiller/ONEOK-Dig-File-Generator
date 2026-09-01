@@ -27,7 +27,8 @@ image dropped into the report's image slot.
 Latitude, longitude, elevation, EDOC, survey date and the pre-dig photos are
 field measurements. The app never writes them — on the staking report and in
 the cheat sheet's Latitude and Longitude columns alike, they are always left
-blank for manual entry.
+blank for manual entry. The Pre_Dig_Photos sheet keeps its own placeholders
+untouched; only the StakingReport image slot receives the aerial.
 
 Anything the uploads cannot establish is written as `Unknown` and flagged in
 the review table rather than guessed.
@@ -69,9 +70,15 @@ Without a token the app still runs: imagery falls back to Esri World Imagery
 The staking report template carries macros and macro-linked buttons. openpyxl
 cannot round-trip those — it drops DrawingML shapes — so the XLSMPATCH section
 edits the workbook at the package level instead, rewriting only the cells that
-change and swapping the bytes of the image already anchored in the report's
-image slot. Everything else, `vbaProject.bin` and `drawing1.xml` included, comes
-through byte-identical.
+change and repointing the report's image slot at the aerial. Everything else,
+`vbaProject.bin` included, comes through byte-identical.
+
+The aerial is added as a **new** media part and only the StakingReport
+picture's own relationship is moved to it. Overwriting the bytes of the part
+already in the slot would be simpler, but in this template that part
+(`image4.jpeg`) is shared with four placeholders on the **Pre_Dig_Photos**
+sheet — so the aerial replaced those too. Pre-dig photos are taken in the field
+and pasted in by hand, so those placeholders have to survive untouched.
 
 That also means the aerial image inherits the template's own anchor, so it is
 always sized and positioned exactly as the slot in your template. The aerial is

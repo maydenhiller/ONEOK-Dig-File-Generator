@@ -220,12 +220,23 @@ EXCEL_EPOCH = _dt.datetime(1899, 12, 30)
 
 @dataclass
 class ImageSlot:
-    """A picture already anchored in the template, ready to be swapped out."""
+    """A picture already anchored in the template, ready to be swapped out.
+
+    ``drawing_path``, ``rel_id`` and the ``pic_*`` offsets are what let the
+    aerial be given its own media part instead of overwriting the one already
+    in the package. In the ONEOK template the StakingReport image slot and the
+    Pre_Dig_Photos placeholders are the *same* media part (image4.jpeg), so
+    overwriting its bytes replaced the pre-dig photo placeholders too.
+    """
 
     media_path: str
     extension: str
     width_emu: int
     height_emu: int
+    drawing_path: str = ""
+    rel_id: str = ""
+    pic_start: int = 0
+    pic_end: int = 0
 
     @property
     def aspect(self) -> float:
@@ -330,11 +341,84 @@ class XlsmPatcher:
                     extension=media.rsplit(".", 1)[-1].lower(),
                     width_emu=width,
                     height_emu=height,
+                    drawing_path=drawing,
+                    rel_id=embed.group(1),
+                    pic_start=block.start(),
+                    pic_end=block.end(),
                 )
         return best
 
-    def replace_image(self, slot: ImageSlot, image_bytes: bytes) -> None:
-        self.parts[slot.media_path] = image_bytes
+    def replace_image(self, slot: ImageSlot, image_bytes: bytes,
+                      extension: str = "png") -> None:
+        """Point this one picture at a new media part.
+
+        The obvious implementation - overwrite ``slot.media_path`` - is wrong
+        for this template. Its StakingReport image slot and the Pre_Dig_Photos
+        placeholders share a single media part, so overwriting the bytes put
+        the aerial in place of the pre-dig photo placeholders as well. Those
+        are filled in by hand after the survey, so they have to be left alone.
+
+        Instead the aerial is added as a new part and only the StakingReport
+        picture's own relationship is repointed at it. Every other picture,
+        on this sheet or any other, keeps the media it already had.
+        """
+        if not slot.drawing_path or not slot.rel_id:
+            # Nothing to repoint - fall back to the in-place swap.
+            self.parts[slot.media_path] = image_bytes
+            return
+
+        extension = extension.lower().lstrip(".")
+        media_path = self._new_media_path(extension)
+        self.parts[media_path] = image_bytes
+        self._ensure_content_type(extension)
+
+        rels_path = _rels_path(slot.drawing_path)
+        rels = self._text(rels_path)
+        new_id = self._new_rel_id(rels)
+        target = _relative_part(media_path, slot.drawing_path)
+        entry = (
+            f'<Relationship Id="{new_id}" Type="http://schemas.openxmlformats.org/'
+            f'officeDocument/2006/relationships/image" Target="{target}"/>'
+        )
+        self.parts[rels_path] = rels.replace(
+            "</Relationships>", entry + "</Relationships>", 1
+        ).encode("utf-8")
+
+        drawing_xml = self._text(slot.drawing_path)
+        chunk = drawing_xml[slot.pic_start:slot.pic_end]
+        chunk = chunk.replace(f'r:embed="{slot.rel_id}"', f'r:embed="{new_id}"', 1)
+        self.parts[slot.drawing_path] = (
+            drawing_xml[:slot.pic_start] + chunk + drawing_xml[slot.pic_end:]
+        ).encode("utf-8")
+
+    def _new_media_path(self, extension: str) -> str:
+        index = 1
+        while f"xl/media/image{index}.{extension}" in self.parts:
+            index += 1
+        while any(
+            name.startswith(f"xl/media/image{index}.") for name in self.parts
+        ):
+            index += 1
+        return f"xl/media/image{index}.{extension}"
+
+    @staticmethod
+    def _new_rel_id(rels: str) -> str:
+        used = {int(n) for n in re.findall(r'Id="rId(\d+)"', rels)}
+        candidate = max(used) + 1 if used else 1
+        return f"rId{candidate}"
+
+    def _ensure_content_type(self, extension: str) -> None:
+        path = "[Content_Types].xml"
+        if path not in self.parts:
+            return
+        xml = self._text(path)
+        if f'Extension="{extension}"' in xml:
+            return
+        kind = "image/jpeg" if extension in ("jpg", "jpeg") else f"image/{extension}"
+        entry = f'<Default Extension="{extension}" ContentType="{kind}"/>'
+        self.parts[path] = xml.replace("<Types", "<Types", 1).replace(
+            "</Types>", entry + "</Types>", 1
+        ).encode("utf-8")
 
     def _drawing_for(self, sheet_name: str) -> Optional[str]:
         path = self._sheet_paths.get(sheet_name)
@@ -383,12 +467,18 @@ class XlsmPatcher:
     # -- output ---------------------------------------------------------
     def to_bytes(self) -> bytes:
         buffer = io.BytesIO()
+        # Parts added since the template was opened (the aerial's own media
+        # part) are not in self.names, so they are appended at the end.
+        added = [name for name in self.parts if name not in self.infos]
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name in self.names:
-                info = self.infos[name]
-                new = zipfile.ZipInfo(name, date_time=info.date_time)
+            for name in self.names + added:
+                info = self.infos.get(name)
+                if info is None:
+                    new = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                else:
+                    new = zipfile.ZipInfo(name, date_time=info.date_time)
+                    new.external_attr = info.external_attr
                 new.compress_type = zipfile.ZIP_DEFLATED
-                new.external_attr = info.external_attr
                 archive.writestr(new, self.parts[name])
         return buffer.getvalue()
 
@@ -483,6 +573,20 @@ def _insert_cell(xml: str, ref: str, value) -> Optional[str]:
 def _rels_path(part: str) -> str:
     folder, _, name = part.rpartition("/")
     return f"{folder}/_rels/{name}.rels"
+
+
+def _relative_part(part: str, base_part: str) -> str:
+    """``part`` expressed relative to the folder holding ``base_part``.
+
+    The inverse of ``_resolve``, used when adding a relationship.
+    """
+    target = part.split("/")
+    folder = base_part.rpartition("/")[0].split("/") if "/" in base_part else []
+    shared = 0
+    while (shared < len(folder) and shared < len(target) - 1
+           and folder[shared] == target[shared]):
+        shared += 1
+    return "/".join([".."] * (len(folder) - shared) + target[shared:])
 
 
 def _resolve(base_part: str, target: str) -> str:
@@ -2346,14 +2450,14 @@ def _north_arrow(draw, width, height, scale=1.0):
 def _legend(draw, entries, width, scale=1.0):
     if not entries:
         return
-    font = _font(int(22 * scale))
-    title_font = _font(int(23 * scale))
-    line_height = 30 * scale
-    box_width = 250 * scale
+    font = _font(int(17 * scale))
+    title_font = _font(int(17 * scale))
+    line_height = 22 * scale
+    box_width = 188 * scale
     for label in entries:
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-        box_width = max(box_width, (right - left) + 60 * scale)
-    box_height = 40 * scale + line_height * len(entries)
+        box_width = max(box_width, (right - left) + 45 * scale)
+    box_height = 30 * scale + line_height * len(entries)
     x0 = width - box_width - 14 * scale
     y0 = 12 * scale
 
@@ -2363,24 +2467,24 @@ def _legend(draw, entries, width, scale=1.0):
         outline=(120, 120, 120),
         width=max(1, int(scale)),
     )
-    draw.text((x0 + 12 * scale, y0 + 6 * scale), "Legend", font=title_font,
+    draw.text((x0 + 9 * scale, y0 + 5 * scale), "Legend", font=title_font,
               fill=(20, 20, 20))
     for index, label in enumerate(entries):
-        y = y0 + 40 * scale + index * line_height
-        draw.text((x0 + 38 * scale, y), label, font=font, fill=(20, 20, 20))
-        radius = 6 * scale
+        y = y0 + 30 * scale + index * line_height
+        draw.text((x0 + 29 * scale, y), label, font=font, fill=(20, 20, 20))
+        radius = 5 * scale
         centre_y = y + line_height * 0.42
-        draw.ellipse([x0 + 20 * scale - radius, centre_y - radius,
-                      x0 + 20 * scale + radius, centre_y + radius], fill=PIPE_RED)
+        draw.ellipse([x0 + 15 * scale - radius, centre_y - radius,
+                      x0 + 15 * scale + radius, centre_y + radius], fill=PIPE_RED)
 
 
 def _title_card(draw, text, scale=1.0):
     if not text:
         return
-    font = _font(int(26 * scale))
+    font = _font(int(20 * scale))
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-    pad_x = 14 * scale
-    pad_y = 10 * scale
+    pad_x = 11 * scale
+    pad_y = 8 * scale
     x0 = 12 * scale
     y0 = 12 * scale
     box_width = (right - left) + pad_x * 2
@@ -2484,8 +2588,17 @@ def render_aerial(
         ax, ay = view.project(alon, alat)
         if -50 <= ax <= width + 50 and -50 <= ay <= height + 50:
             _draw_flag(draw, ax, ay, scale)
-            _outlined_text(draw, (ax + 26 * scale, ay - 48 * scale),
-                           name or "AGM", _font(int(24 * scale)),
+            label = name or "AGM"
+            label_font = _font(int(24 * scale))
+            left, top, right, bottom = draw.textbbox((0, 0), label, font=label_font)
+            label_width = right - left
+            # The legend sits in the top-right corner. Put the label on the
+            # other side of the flag rather than let it run underneath.
+            if ax + 26 * scale + label_width > width * 0.62:
+                label_x = ax - 12 * scale - label_width
+            else:
+                label_x = ax + 26 * scale
+            _outlined_text(draw, (label_x, ay - 48 * scale), label, label_font,
                            weight=max(1, int(2 * scale)))
             if name:
                 legend_entries.append(name)
@@ -2961,7 +3074,12 @@ def build_staking_report(
                 "so the aerial image was not inserted."
             )
         else:
-            patcher.replace_image(slot, _encode_for_slot(dig.aerial_png, slot))
+            # PNG, not the placeholder's own format: the aerial gets a fresh
+            # media part rather than overwriting the placeholder's, so it is
+            # not tied to that part's extension.
+            patcher.replace_image(
+                slot, _encode_for_slot(dig.aerial_png, slot, "png"), "png"
+            )
 
     return patcher.to_bytes(), warnings
 
@@ -2989,8 +3107,8 @@ def _numeric_if_possible(value):
     return text
 
 
-def _encode_for_slot(png_bytes: bytes, slot) -> bytes:
-    """Match the placeholder's format and aspect so Excel does not stretch it."""
+def _encode_for_slot(png_bytes: bytes, slot, extension: str = "") -> bytes:
+    """Match the slot's aspect so Excel does not stretch the image."""
 
     image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
 
@@ -3007,7 +3125,7 @@ def _encode_for_slot(png_bytes: bytes, slot) -> bytes:
             image = image.crop((0, top, width, top + new_height))
 
     buffer = io.BytesIO()
-    if slot.extension in ("jpg", "jpeg"):
+    if (extension or slot.extension) in ("jpg", "jpeg"):
         image.save(buffer, format="JPEG", quality=88, optimize=True)
     else:
         image.save(buffer, format="PNG", optimize=True)
