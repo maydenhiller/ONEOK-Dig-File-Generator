@@ -14,7 +14,7 @@ image dropped into the report's image slot.
 | --- | --- |
 | Dig name, ODO, stationing | The dig sheet row carrying a Dig Number |
 | Surveyed by | Sidebar. The phone number is left alone — the template XLOOKUPs it from this name |
-| County, State | The alignment sheet's county band. The sidebar fields override it for the whole batch when filled in |
+| County, State | The alignment sheet's county band. No sidebar entry — correct it in the review table if a sheet is ever misread |
 | Upstream / downstream reference and feet to AGM | The two reference cells, whether they name an AGM or a launch/receive valve |
 | Line name | Alignment sheet title block |
 | Alignment sheet number | Pipeline number + sheet number off the alignment sheet |

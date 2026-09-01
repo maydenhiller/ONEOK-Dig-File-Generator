@@ -3045,18 +3045,6 @@ surveyor_name = st.sidebar.text_input(
     help="The phone number fills itself in from the template's employee table.",
 )
 tool_type = st.sidebar.text_input("Tool type", value=DEFAULT_TOOL_TYPE)
-county_entry = st.sidebar.text_input(
-    "County",
-    value="",
-    help="Applied to every dig in the batch. Leave blank to use whatever the "
-         "alignment sheet says.",
-)
-state_entry = st.sidebar.text_input(
-    "State",
-    value="",
-    help="Applied to every dig in the batch. Leave blank to use whatever the "
-         "alignment sheet says.",
-)
 staking_notes = st.sidebar.text_area("Staking notes", value=DEFAULT_STAKING_NOTES, height=110)
 
 st.sidebar.header("Aerial image")
@@ -3165,13 +3153,11 @@ if st.button("Read uploads", type="primary", disabled=not ready):
                     problems.append(f"{upload.name}: {error}")
 
     for dig in digs:
+        # County and state come off the alignment sheet's county band. They are
+        # not sidebar fields - correct them in the review table if a sheet is
+        # ever misread.
         apply_alignment(dig, sheets)
         dig.staking_notes = staking_notes
-        # Typed values win over anything read off an alignment sheet.
-        if county_entry.strip():
-            dig.county = county_entry.strip()
-        if state_entry.strip():
-            dig.state = state_entry.strip()
 
     pipeline = None
     if kmz_file is not None:
