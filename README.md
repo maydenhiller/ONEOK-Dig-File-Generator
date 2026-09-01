@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/31648291/README.md)
 # ONEOK Dig File Generator
 
 A Streamlit app that turns dig sheets into filled staking reports and a filled
@@ -14,8 +13,10 @@ image dropped into the report's image slot.
 | Field | Source |
 | --- | --- |
 | Dig name, ODO, stationing | The dig sheet row carrying a Dig Number |
-| Upstream / downstream reference and feet to AGM | US/DS AGM Ref and Distance columns |
-| Line name, county, state | Alignment sheet title block |
+| Surveyed by | Sidebar. The phone number is left alone — the template XLOOKUPs it from this name |
+| County, State | The alignment sheet's county band. The sidebar fields override it for the whole batch when filled in |
+| Upstream / downstream reference and feet to AGM | The two reference cells, whether they name an AGM or a launch/receive valve |
+| Line name | Alignment sheet title block |
 | Alignment sheet number | Pipeline number + sheet number off the alignment sheet |
 | Tract number, legal description | Alignment sheet PLSS band, matched to the dig's station |
 | HCA | Alignment sheet HCA band, falling back to the dig sheet's Is HCA column |
@@ -24,7 +25,9 @@ image dropped into the report's image slot.
 | Cheat sheet weld rows | Weld distances, with formula signs from the line's stationing direction |
 
 Latitude, longitude, elevation, EDOC, survey date and the pre-dig photos are
-field measurements and are deliberately left for manual entry.
+field measurements. The app never writes them — on the staking report and in
+the cheat sheet's Latitude and Longitude columns alike, they are always left
+blank for manual entry.
 
 Anything the uploads cannot establish is written as `Unknown` and flagged in
 the review table rather than guessed.
@@ -64,29 +67,57 @@ Without a token the app still runs: imagery falls back to Esri World Imagery
 ## How the template is edited
 
 The staking report template carries macros and macro-linked buttons. openpyxl
-cannot round-trip those — it drops DrawingML shapes — so `digfiles/xlsmpatch.py`
+cannot round-trip those — it drops DrawingML shapes — so the XLSMPATCH section
 edits the workbook at the package level instead, rewriting only the cells that
 change and swapping the bytes of the image already anchored in the report's
 image slot. Everything else, `vbaProject.bin` and `drawing1.xml` included, comes
 through byte-identical.
 
 That also means the aerial image inherits the template's own anchor, so it is
-always sized and positioned exactly as the slot in your template.
+always sized and positioned exactly as the slot in your template. The aerial is
+rendered to that slot's actual aspect ratio, read from the template you upload,
+so it is never cropped to fit — cropping is what used to clip the title card in
+its top-left corner.
+
+Everything drawn on the aerial is sized for the slot's real display size
+(roughly 650 px wide), not for the rendered pixel count, so the labels stay
+legible after Excel shrinks the image.
+
+That sizing only works with a font that can actually be scaled.
+`ImageFont.load_default()` returns a fixed-size bitmap font that ignores the
+size it is asked for, so on a host with no system fonts every label came out at
+about 11 px however large it was requested — roughly 4 px once Excel shrank the
+image. The app now tries the usual DejaVu and Liberation paths, then falls back
+to `load_default(size=...)`, which scales (Pillow 10.1+, pinned in
+`requirements.txt`). `packages.txt` also apt-installs `fonts-dejavu-core` on
+Streamlit Cloud so the first path is normally the one taken.
+
+The workbook is also flagged to recalculate on open. Formula cells carry the
+value Excel last computed, and the template's phone number is an XLOOKUP
+against the surveyor name with a stale cached result — without the flag the
+report opens showing the old value until something nudges the cell.
 
 ## Layout
 
+The whole app is one file. That is deliberate: a Streamlit Cloud deploy fails
+with a bare `ModuleNotFoundError` if a subpackage does not make it into the
+repo, and there is nothing to go missing here.
+
 ```
-app.py                  Streamlit UI
-digfiles/
-  models.py             Dig record and station/AGM helpers
-  digsheet.py           Dig sheet parsing, xlsx and PDF
-  alignment.py          Alignment sheet title block, PLSS and HCA bands
-  kmz.py                KMZ/KML centerline and placemarks
-  aerial.py             Tile fetching and the aerial image render
-  directions.py         Mapbox directions, ported from Dig-Site-Directions-Generator
-  cheatsheet.py         Cheat sheet writer
-  staking.py            Staking report writer
-  xlsmpatch.py          Package-level .xlsm editing
+app.py              Everything, in sections:
+                      MODELS       Dig record, station and AGM helpers
+                      XLSMPATCH    Package-level .xlsm editing
+                      DIGSHEET     Dig sheet parsing, xlsx and PDF
+                      ALIGNMENT    Title block, PLSS and HCA bands
+                      KMZ          Centerline and placemarks
+                      AERIAL       Tile fetching and the image render
+                      DIRECTIONS   Mapbox, ported from Dig-Site-Directions-Generator
+                      CHEATSHEET   Cheat sheet writer
+                      STAKING      Staking report writer
+                      STREAMLIT UI
+requirements.txt
+packages.txt        apt packages for Streamlit Cloud (fonts)
+.streamlit/config.toml
 ```
 
 ## Notes
@@ -95,8 +126,50 @@ digfiles/
   filled report checked (NL3DH-24-F1 → 16, STSB-24-F1 → 6, RJSJ-25-F1 → 7).
   If your tract numbering ever diverges from the section, correct it in the
   review table before generating.
+- **PDF cells are read in content-stream order, not by position.** These
+  sheets are printed from Excel with text overflowing its columns, so a
+  reference cell and the number beside it physically overlap in x. Sorting
+  characters by position interleaves them into nonsense
+  ("Dan4v9il4le7,." from "Danville," and "4947.55"). Each cell is emitted as
+  one contiguous run, so a run ends where x jumps backwards or leaves a gap;
+  cells are then assigned to columns by their start position, which the
+  overlap does not disturb.
+- **References are not always AGMs.** An upstream reference is often
+  "LAUNCH VALVE Danville, Sta. 2582+14". The report wants just "Launch Valve",
+  so the reference type is taken off the front rather than everything up to
+  the first comma.
+- **Line name is applied without needing a station match.** It describes the
+  pipeline, not a position on it, so any uploaded sheet for that line supplies
+  it. Only the sheet number, county, PLSS and HCA bands need the sheet that
+  actually covers the dig.
+- **Alignment sheet bands are read from the sheet's own structure.** The
+  full-width horizontal rules split the sheet into banded rows, each labelled
+  down the left edge (COUNTY, PLSS, CLASS, HCA). Within a band, the drawn
+  vertical dividers bound each segment, and a segment's station range comes
+  from the axis-tick regression — so a station falls in the section it is
+  actually drawn in, rather than the nearest label. HCA stretches are thin
+  horizontal rules on the HCA row, not filled blocks; when the row is present
+  and carries none, that is a reliable "No".
+- The station range comes from the axis tick row, not from every
+  station-shaped token on the page — real sheets often have no "From X To Y"
+  line, and stray tokens produce a nonsense range.
+- **Alignment sheets** are matched to a dig by station. When none covers it,
+  the app says so and lists every sheet it read with its station range, rather
+  than silently leaving the fields Unknown. The sheet number written onto the
+  report comes from the filename (`10222_41 Alignment Sheet.pdf` → `10222_41`),
+  since the sheet itself prints a zero-padded `Sheet 041`.
 - **Stationing direction** is detected from each dig sheet's own odometer and
   stationing columns, so mixed batches across ascending and descending lines
   come out right in one run.
-- **PDF dig sheets** are parsed positionally from the column headers. Excel dig
-  sheets are the more reliable input where you have the choice.
+- **PDF dig sheets**: the anomaly row must satisfy all three conditions at
+  once — it starts with a dig name (a value in the leftmost Dig Number column),
+  that name matches the heading at the top centre of page one, and the row sits
+  in a yellow highlight band. A dig sheet can carry other highlighted rows that
+  are not the call anomaly, so no single signal is trusted on its own.
+  Field values are then read off the row text with anchored patterns rather
+  than by trusting column detection, because the wrapped multi-line headers
+  merge unpredictably.
+  When nothing matches, the app names which of the three conditions eliminated
+  every row and prints what it did see — heading, dig names found, row count,
+  highlight bands — so it can be corrected against the real sheet rather than
+  guessed at.

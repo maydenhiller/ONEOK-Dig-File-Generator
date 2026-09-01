@@ -2192,18 +2192,69 @@ def _basemap_image(view: MapView, template: str, token: str = "") -> tuple:
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
+_FONT_CACHE: dict = {}
+FONT_IS_SCALABLE = True
+
+_FONT_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+)
+
+_FONT_NAMES = ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf", "LiberationSans-Bold.ttf")
+
+
 def _font(size: int):
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-    ):
+    """A font that actually honours the requested size.
+
+    ``ImageFont.load_default()`` returns a FIXED-SIZE bitmap font - it ignores
+    the size argument completely. Falling back to it means every label renders
+    at about 11 px however large it was asked to be, and once Excel shrinks the
+    image into its slot that is illegible. Streamlit Cloud has no DejaVu
+    installed, so this fallback was being hit in production even though it
+    never was in development, which is why scaling the sizes changed nothing.
+
+    Pillow 10.1+ can scale its own bundled font through
+    ``load_default(size=...)``, needing no system fonts and no extra files.
+    """
+    global FONT_IS_SCALABLE
+
+    size = max(6, int(round(size)))
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+
+    font = None
+    for path in _FONT_PATHS:
         try:
-            return ImageFont.truetype(path, size)
-        except Exception:
+            font = ImageFont.truetype(path, size)
+            break
+        except Exception:  # noqa: BLE001
             continue
-    return ImageFont.load_default()
+
+    if font is None:
+        for name in _FONT_NAMES:
+            try:
+                font = ImageFont.truetype(name, size)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=size)
+        except TypeError:
+            FONT_IS_SCALABLE = False
+            font = ImageFont.load_default()
+
+    _FONT_CACHE[size] = font
+    return font
 
 
 def _outlined_text(draw, xy, text, font, fill=LABEL_WHITE, outline=SHADOW, weight=2):
@@ -2228,8 +2279,8 @@ def _centred_text(draw, centre, text, font, **kwargs):
 
 def _draw_pin(draw, x, y, scale=1.0, colour=(255, 214, 0)):
     """A small Google Earth style pushpin."""
-    height = 22 * scale
-    radius = 7 * scale
+    height = 30 * scale
+    radius = 9 * scale
     draw.line([(x, y), (x, y - height + radius)], fill=(60, 60, 60),
               width=max(2, int(3 * scale)))
     draw.ellipse(
@@ -2242,13 +2293,13 @@ def _draw_pin(draw, x, y, scale=1.0, colour=(255, 214, 0)):
 
 def _draw_flag(draw, x, y, scale=1.0, colour=PIPE_RED):
     """A small flag marker, used for AGMs."""
-    height = 24 * scale
+    height = 32 * scale
     draw.line([(x, y), (x, y - height)], fill=(245, 245, 245),
-              width=max(2, int(3 * scale)))
+              width=max(2, int(4 * scale)))
     draw.polygon(
         [(x + scale, y - height),
-         (x + 16 * scale, y - height + 6 * scale),
-         (x + scale, y - height + 12 * scale)],
+         (x + 21 * scale, y - height + 8 * scale),
+         (x + scale, y - height + 16 * scale)],
         fill=colour,
     )
 
@@ -2263,45 +2314,46 @@ def _scale_bar(draw, view, width, height, scale=1.0):
     else:
         target, pixels = 400, 400 / feet_per_pixel
 
-    right = width - int(62 * scale)
+    right = width - int(70 * scale)
     left = right - pixels
-    baseline = height - int(18 * scale)
-    thickness = max(2, int(3 * scale))
-    tick = 6 * scale
+    baseline = height - int(20 * scale)
+    thickness = max(2, int(4 * scale))
+    tick = 8 * scale
     draw.line([(left, baseline), (right, baseline)], fill=LABEL_WHITE, width=thickness)
     draw.line([(left, baseline - tick), (left, baseline + tick * 0.7)],
               fill=LABEL_WHITE, width=thickness)
     draw.line([(right, baseline - tick), (right, baseline + tick * 0.7)],
               fill=LABEL_WHITE, width=thickness)
-    font = _font(int(15 * scale))
-    _outlined_text(draw, (left, baseline - 26 * scale), f"{target:,} ft", font,
-                   weight=max(1, int(scale)))
+    font = _font(int(22 * scale))
+    _outlined_text(draw, (left, baseline - 34 * scale), f"{target:,} ft", font,
+                   weight=max(1, int(1.5 * scale)))
 
 
 def _north_arrow(draw, width, height, scale=1.0):
-    font = _font(int(20 * scale))
-    x = width - 28 * scale
-    y = height - 62 * scale
+    font = _font(int(26 * scale))
+    x = width - 32 * scale
+    y = height - 76 * scale
     draw.polygon(
-        [(x, y), (x - 8 * scale, y + 22 * scale),
-         (x, y + 16 * scale), (x + 8 * scale, y + 22 * scale)],
+        [(x, y), (x - 10 * scale, y + 28 * scale),
+         (x, y + 20 * scale), (x + 10 * scale, y + 28 * scale)],
         fill=LABEL_WHITE,
         outline=SHADOW,
     )
-    _centred_text(draw, (x, y + 38 * scale), "N", font, weight=max(1, int(scale)))
+    _centred_text(draw, (x, y + 46 * scale), "N", font,
+                  weight=max(1, int(1.5 * scale)))
 
 
 def _legend(draw, entries, width, scale=1.0):
     if not entries:
         return
-    font = _font(int(15 * scale))
-    title_font = _font(int(16 * scale))
-    line_height = 21 * scale
-    box_width = 190 * scale
+    font = _font(int(22 * scale))
+    title_font = _font(int(23 * scale))
+    line_height = 30 * scale
+    box_width = 250 * scale
     for label in entries:
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-        box_width = max(box_width, (right - left) + 46 * scale)
-    box_height = 28 * scale + line_height * len(entries)
+        box_width = max(box_width, (right - left) + 60 * scale)
+    box_height = 40 * scale + line_height * len(entries)
     x0 = width - box_width - 14 * scale
     y0 = 12 * scale
 
@@ -2311,24 +2363,24 @@ def _legend(draw, entries, width, scale=1.0):
         outline=(120, 120, 120),
         width=max(1, int(scale)),
     )
-    draw.text((x0 + 10 * scale, y0 + 5 * scale), "Legend", font=title_font,
+    draw.text((x0 + 12 * scale, y0 + 6 * scale), "Legend", font=title_font,
               fill=(20, 20, 20))
     for index, label in enumerate(entries):
-        y = y0 + 28 * scale + index * line_height
-        draw.text((x0 + 30 * scale, y), label, font=font, fill=(20, 20, 20))
-        radius = 4 * scale
+        y = y0 + 40 * scale + index * line_height
+        draw.text((x0 + 38 * scale, y), label, font=font, fill=(20, 20, 20))
+        radius = 6 * scale
         centre_y = y + line_height * 0.42
-        draw.ellipse([x0 + 15 * scale - radius, centre_y - radius,
-                      x0 + 15 * scale + radius, centre_y + radius], fill=PIPE_RED)
+        draw.ellipse([x0 + 20 * scale - radius, centre_y - radius,
+                      x0 + 20 * scale + radius, centre_y + radius], fill=PIPE_RED)
 
 
 def _title_card(draw, text, scale=1.0):
     if not text:
         return
-    font = _font(int(18 * scale))
+    font = _font(int(26 * scale))
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-    pad_x = 12 * scale
-    pad_y = 9 * scale
+    pad_x = 14 * scale
+    pad_y = 10 * scale
     x0 = 12 * scale
     y0 = 12 * scale
     box_width = (right - left) + pad_x * 2
@@ -2412,7 +2464,8 @@ def render_aerial(
                 if -width <= x <= width * 2 and -height <= y <= height * 2
             ]
             if len(visible) >= 2:
-                draw.line(points, fill=PIPE_RED, width=4, joint="curve")
+                draw.line(points, fill=PIPE_RED, width=max(4, int(4 * scale)),
+                          joint="curve")
                 drew_line = True
         if drew_line:
             legend_entries.append(_pipeline_legend_label(pipeline, dig))
@@ -2431,8 +2484,8 @@ def render_aerial(
         ax, ay = view.project(alon, alat)
         if -50 <= ax <= width + 50 and -50 <= ay <= height + 50:
             _draw_flag(draw, ax, ay, scale)
-            _outlined_text(draw, (ax + 20 * scale, ay - 36 * scale),
-                           name or "AGM", _font(int(17 * scale)),
+            _outlined_text(draw, (ax + 26 * scale, ay - 48 * scale),
+                           name or "AGM", _font(int(24 * scale)),
                            weight=max(1, int(2 * scale)))
             if name:
                 legend_entries.append(name)
@@ -2441,8 +2494,8 @@ def render_aerial(
 
     dx, dy = view.project(longitude, latitude)
     _draw_pin(draw, dx, dy, scale)
-    _centred_text(draw, (dx, dy + 28 * scale), dig.name,
-                  _font(int(26 * scale)), weight=max(2, int(2.5 * scale)))
+    _centred_text(draw, (dx, dy + 34 * scale), dig.name,
+                  _font(int(32 * scale)), weight=max(2, int(2.5 * scale)))
     if dig.name:
         legend_entries.append(dig.name)
 
