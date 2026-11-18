@@ -2871,10 +2871,11 @@ def generate_directions(latitude: float, longitude: float, token: str) -> Direct
 # Fill the dig stake cheat sheet - three rows per dig, U/S weld, anomaly, D/S weld.
 #
 # The template ships in two flavours, ascending and descending station numbers.
-# They differ only in the sign of the weld formulas, so rather than asking which
-# one to upload, the correct formulas are written per dig from the stationing
-# direction detected in that dig's own sheet. Either template can be used as the
-# starting point.
+# They differ only in the sign of the station formulas, so the correct formulas
+# are written per dig from the stationing direction detected in that dig's own
+# sheet - either template produces correct numbers. Upload both and the one
+# matching the batch's own direction is used as the starting point, so the
+# sheet that comes out also reads the way that line's crew expects.
 
 FIRST_ROW = 6
 ROWS_PER_DIG = 3
@@ -2889,6 +2890,46 @@ COL_HCA = 7         # G
 COL_DEPTH = 8       # H
 COL_LAT = 9         # I
 COL_LON = 10        # J
+
+
+def cheat_sheet_flavour(template_bytes: bytes) -> Optional[str]:
+    """'ascending' or 'descending', read from the template's own U/S weld formula.
+
+    The two templates are identical but for column C: the ascending one
+    subtracts the weld distance from the anomaly's station, the descending one
+    adds it. Reading the formula means the flavour does not depend on how the
+    file happens to be named.
+    """
+    import openpyxl
+
+    try:
+        sheet = openpyxl.load_workbook(io.BytesIO(template_bytes)).worksheets[0]
+    except Exception:  # noqa: BLE001
+        return None
+    formula = str(sheet.cell(FIRST_ROW, COL_STATION).value or "").replace(" ", "")
+    if re.fullmatch(r"=C\d+-D\d+", formula):
+        return "ascending"
+    if re.fullmatch(r"=C\d+\+D\d+", formula):
+        return "descending"
+    return None
+
+
+def pick_cheat_template(templates: dict, digs: Iterable[Dig]) -> Optional[bytes]:
+    """Choose a template for this batch. ``templates`` maps flavour -> bytes.
+
+    The dig sheets decide: each carries its own stationing direction, and the
+    majority wins. With only one template uploaded that one is used - the
+    formulas are still written per dig, so the numbers come out right either
+    way.
+    """
+    if not templates:
+        return None
+    digs = list(digs)
+    ascending = sum(1 for dig in digs if dig.station_ascends)
+    wanted = "ascending" if ascending * 2 >= len(digs) else "descending"
+    if wanted in templates:
+        return templates[wanted]
+    return next(iter(templates.values()))
 
 
 def build_cheat_sheet(
@@ -3206,8 +3247,13 @@ with col_left:
     template_file = st.file_uploader(
         "Staking report template (.xlsm)", type=["xlsm", "xlsx"], key="template"
     )
-    cheat_file = st.file_uploader(
-        "Cheat sheet template (.xlsx)", type=["xlsx"], key="cheat"
+    cheat_files = st.file_uploader(
+        "Cheat sheet template(s) (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="cheat",
+        help="Upload both the ascending and descending versions and the one "
+             "matching the dig sheets' stationing direction is used.",
     )
     kmz_file = st.file_uploader(
         "Pipeline KMZ (for the aerial image)", type=["kmz", "kml"], key="kmz"
@@ -3226,11 +3272,11 @@ with col_right:
         key="alignment_upload",
     )
 
-ready = bool(template_file and cheat_file and dig_files)
+ready = bool(template_file and cheat_files and dig_files)
 if not ready:
     st.info(
-        "Upload the staking report template, the cheat sheet template and at "
-        "least one dig sheet to begin."
+        "Upload the staking report template, at least one cheat sheet template "
+        "and at least one dig sheet to begin."
     )
 
 
@@ -3387,7 +3433,18 @@ if digs:
         )
 
         template_bytes = template_file.getvalue()
-        cheat_bytes = cheat_file.getvalue()
+        # Keyed by flavour, so uploading both versions (in either order) gives
+        # one of each and a duplicate upload cannot shadow the other flavour.
+        cheat_templates = {}
+        unknown_cheat = []
+        for upload in cheat_files:
+            data = upload.getvalue()
+            flavour = cheat_sheet_flavour(data)
+            if flavour is None:
+                unknown_cheat.append(upload.name)
+                cheat_templates.setdefault(f"unrecognised:{upload.name}", data)
+            else:
+                cheat_templates.setdefault(flavour, data)
         slot_aspect = template_image_aspect(template_bytes)
         pipeline = st.session_state.pipeline
         outputs = {}
@@ -3435,11 +3492,39 @@ if digs:
                 issues.append(f"{dig.name}: staking report failed — {error}")
 
         try:
-            outputs["Dig Stake Cheat Sheet.xlsx"] = build_cheat_sheet(
-                cheat_bytes,
-                digs,
-                auto_notes=auto_notes,
-            )
+            chosen = pick_cheat_template(cheat_templates, digs)
+            if chosen is None:
+                issues.append("No cheat sheet template uploaded, so no cheat sheet was made.")
+            else:
+                outputs["Dig Stake Cheat Sheet.xlsx"] = build_cheat_sheet(
+                    chosen,
+                    digs,
+                    auto_notes=auto_notes,
+                )
+                ascending = sum(1 for dig in digs if dig.station_ascends)
+                wanted = "ascending" if ascending * 2 >= len(digs) else "descending"
+                used = next(
+                    (name for name, data in cheat_templates.items() if data is chosen),
+                    wanted,
+                )
+                if used == wanted:
+                    st.caption(
+                        f"Cheat sheet built from the **{wanted}** template "
+                        f"({ascending} of {len(digs)} digs station ascending)."
+                    )
+                else:
+                    st.caption(
+                        f"These dig sheets are **{wanted}**, but no {wanted} cheat "
+                        f"sheet template was uploaded — used the one supplied. The "
+                        f"station formulas are still written per dig, so the numbers "
+                        f"are right."
+                    )
+                for name in unknown_cheat:
+                    issues.append(
+                        f"{name}: could not tell whether this is the ascending or "
+                        "descending cheat sheet template (cell C6 is not a "
+                        "station formula), so it was treated as a fallback."
+                    )
         except Exception as error:  # noqa: BLE001
             issues.append(f"Cheat sheet failed — {error}")
 

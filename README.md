@@ -23,6 +23,7 @@ image dropped into the report's image slot.
 | Directions | Mapbox, using the same logic as the Dig Site Directions Generator |
 | Aerial image | Satellite tiles + the uploaded KMZ centerline and placemarks |
 | Cheat sheet weld rows | Weld distances, with formula signs from the line's stationing direction |
+| Cheat sheet flavour | Whichever uploaded template matches the dig sheets' stationing direction |
 
 Elevation, EDOC, survey date and the pre-dig photos are field measurements, and
 the staking report's latitude and longitude are too - the app never writes them.
@@ -36,8 +37,10 @@ the review table rather than guessed.
 ## Uploads
 
 1. **Staking report template** (`.xlsm`) — your ONEOK Dig Stake Template
-2. **Cheat sheet template** (`.xlsx`) — either the ascending or descending
-   version; the app writes the right formulas per dig either way
+2. **Cheat sheet template(s)** (`.xlsx`) — upload both the ascending and the
+   descending version and the app picks the one matching the dig sheets'
+   stationing direction. Either one on its own still works; the formulas are
+   written per dig regardless
 3. **Dig sheets** (`.pdf` or `.xlsx`, several at once)
 4. **Alignment sheets** (`.pdf`, optional)
 5. **Pipeline KMZ** (`.kmz` or `.kml`, optional — needed for the centerline and
@@ -180,3 +183,18 @@ packages.txt        apt packages for Streamlit Cloud (fonts)
   every row and prints what it did see — heading, dig names found, row count,
   highlight bands — so it can be corrected against the real sheet rather than
   guessed at.
+
+## Choosing the cheat sheet template
+
+The ascending and descending cheat sheet templates are identical but for
+column C: ascending subtracts the weld distance from the anomaly's station,
+descending adds it. The app reads cell C6 to tell them apart, so the choice
+does not depend on the file names.
+
+Which one it starts from comes from the dig sheets themselves — each carries
+its own stationing direction, and the majority of the batch wins. The station
+formulas are still written per dig on top of that, so a mixed batch across
+ascending and descending lines comes out right in one run whichever template
+was used; picking the matching one just means the sheet also reads the way
+that line's crew expects. If only one template is uploaded, that one is used
+and the app says so.
