@@ -1334,11 +1334,35 @@ def _looks_like_header(tokens) -> bool:
 
 
 def pdf_digsheet_report(data: bytes, filename: str) -> dict:
-    """What the parser saw in a PDF, for when it finds nothing."""
+    """What the parser saw in a PDF, for when it finds nothing.
+
+    This only runs once a sheet has already failed to parse, so it must never
+    raise: an exception here replaces a useful explanation with a stack trace
+    and takes the whole app down with it.
+    """
+    try:
+        return _pdf_digsheet_report(data, filename)
+    except Exception as error:  # noqa: BLE001
+        return {
+            "file": filename,
+            "why_nothing_matched": (
+                "No anomaly row was found, and reading the sheet's structure to "
+                f"explain why also failed ({type(error).__name__}: {error})."
+            ),
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _pdf_digsheet_report(data: bytes, filename: str) -> dict:
+    """The real work. Call ``pdf_digsheet_report``, which cannot raise."""
     try:
         rows, heading, bands, columns = _read_pdf(data)
     except Exception as error:  # noqa: BLE001
-        return {"file": filename, "error": str(error)}
+        return {
+            "file": filename,
+            "why_nothing_matched": f"the PDF could not be read ({error}).",
+            "error": str(error),
+        }
 
     matches, tally = _select_anomaly_rows(rows, heading, bands)
 
@@ -1359,7 +1383,8 @@ def pdf_digsheet_report(data: bytes, filename: str) -> dict:
         "3_and_are_highlighted": tally["and_are_highlighted"],
         "dig_names_in_the_dig_number_column": tally["dig_names_seen"],
         "highlight_bands_found": len(bands),
-        "columns_detected": [name for _, _, name in columns] if columns else None,
+        # _pdf_columns yields (x0, name) pairs, not triples.
+        "columns_detected": [name for _, name in columns] if columns else None,
         "example_rows_with_a_dig_number": samples,
         "first_data_row": rows[0]["_raw"][:180] if rows else None,
     }
