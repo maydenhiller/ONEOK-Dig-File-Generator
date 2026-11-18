@@ -22,7 +22,7 @@ image dropped into the report's image slot.
 | HCA | Alignment sheet HCA band, falling back to the dig sheet's Is HCA column |
 | Directions | Mapbox, using the same logic as the Dig Site Directions Generator |
 | Aerial image | Satellite tiles + the uploaded KMZ centerline and placemarks |
-| Dig position | The dig sheet's ILI coordinate, or measured along the KMZ centerline between the two referenced AGMs when the sheet carries none |
+| Dig position | The anomaly row's ILI coordinate; failing that, interpolated by odometer between the AGM rows on the same sheet (following the KMZ centerline when one is uploaded) |
 | Cheat sheet weld rows | Weld distances, with formula signs from the line's stationing direction |
 | Cheat sheet flavour | Whichever uploaded template matches the dig sheets' stationing direction |
 
@@ -213,30 +213,32 @@ was used; picking the matching one just means the sheet also reads the way
 that line's crew expects. If only one template is uploaded, that one is used
 and the app says so.
 
-## When a sheet carries no coordinates
+## When the anomaly row carries no coordinates
 
 Some dig sheets print ILI Latitude/Longitude only on the AGM rows, never on the
-anomaly row (the RBB and MLT sheets are like this). The sheet still says how far
-the dig sits from the AGM either side of it, and the KMZ carries both those AGMs
-and the centerline, so the position is **measured along the line** rather than
-guessed:
+anomaly row (the RBB and MLT sheets are like this). Those AGM rows are enough:
+each carries an **odometer as well as a position**, and they bracket the
+anomaly. Odometer increases downstream by definition, so two of them fix both
+where the dig is and which way is downstream — nothing has to be assumed about
+the direction of the line or of the KMZ, and no KMZ is needed at all.
 
-- both referenced AGMs are located on the centerline;
-- the dig is placed between them, in proportion to the sheet's own two
-  distances — so a KMZ whose centerline length disagrees slightly with the
-  odometer still lands the dig in the right relative spot;
-- the direction comes from where the two AGMs actually fall on the line, not
-  from an assumption about how the KMZ was drawn.
+The dig is placed between the two anchors in proportion to its odometer. With a
+KMZ uploaded, the path between them is followed along the centerline so a bend
+is accounted for; without one, the straight line between them is used. The app
+compares the two: the pipe can never be shorter than the straight line between
+two points on it, so the difference measures exactly how much bend is being
+ignored, and it says so with the figure when it matters. On the RBB sheets the
+pipe runs 136 ft longer than the chord over a 5,248 ft span, which moves the
+stake about 234 ft — so for these, upload the KMZ.
 
-If only one of the two AGMs is in the KMZ there is nothing to set the direction
-from, so the dig is **not** placed — a stake on the wrong side of an AGM is
-worse than no aerial. The app says which digs it placed, and flags it when the
-KMZ and the dig sheet disagree about how far apart the AGMs are, or when the
-AGMs sit well off the centerline (usually the wrong line's KMZ).
+If the sheet prints no coordinates anywhere, the app falls back to locating the
+two referenced AGMs in the KMZ and walking between them. That path needs both
+AGMs present, since the KMZ alone does not say which way is downstream.
 
-A position worked out this way feeds the aerial image, the driving directions
-and the county lookup. It is never written into the report's Latitude and
-Longitude cells — those stay blank for the field measurement, as always.
+A position worked out any of these ways feeds the aerial image, the driving
+directions and the county lookup. It is never written into the report's
+Latitude and Longitude cells — those stay blank for the field measurement, as
+always.
 
 ## County and State
 

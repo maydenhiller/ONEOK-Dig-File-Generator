@@ -156,6 +156,12 @@ class Dig:
     # than printed on the dig sheet.
     position_from_kmz: bool = False
 
+    # (odometer, latitude, longitude) for every row on this dig's own sheet
+    # that printed a coordinate - in practice the AGM rows. These bracket the
+    # dig and carry odometers, so they fix both its position and which way is
+    # downstream without needing anything else.
+    sheet_anchors: list = field(default_factory=list)
+
     warnings: list = field(default_factory=list)
 
     # --- convenience ----------------------------------------------------
@@ -869,12 +875,51 @@ def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
         return []
 
     ascends = detect_station_ascends(rows)
+    anchors = sheet_anchors(rows)
     digs = []
     for row, name in anomalies:
         row = dict(row)
         row["dig_number"] = name
-        digs.append(_row_to_dig(row, source_file, ascends))
+        dig = _row_to_dig(row, source_file, ascends)
+        dig.sheet_anchors = anchors
+        digs.append(dig)
     return digs
+
+
+# Latitude then longitude, anywhere in a row. Printed at the end of the AGM
+# rows, sometimes glued to the text before them ("...Two Track Rd36.856168").
+ROW_LATLON_RE = re.compile(r"(-?\d{1,3}\.\d{4,})\s*(-?\d{1,3}\.\d{4,})")
+
+
+def sheet_anchors(rows) -> list:
+    """(odometer, latitude, longitude) for every row that printed a position.
+
+    On these sheets only the AGM rows carry coordinates, and they bracket the
+    anomaly. Because each also carries an odometer, two of them fix the dig's
+    position *and* settle which way is downstream - odometer increases
+    downstream by definition, so no assumption about direction is needed.
+    """
+    found = {}
+    for row in rows:
+        raw = row.get("_raw") or ""
+        match = None
+        for match in ROW_LATLON_RE.finditer(raw):
+            pass  # the last pair on the row is the coordinate
+        if match is None:
+            continue
+        try:
+            latitude, longitude = float(match.group(1)), float(match.group(2))
+        except ValueError:
+            continue
+        if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+            continue
+        odometer = _to_float(row.get("odometer"))
+        if odometer is None:
+            odometer = _to_float(_parse_row_text(raw).get("odometer"))
+        if odometer is None:
+            continue
+        found.setdefault(round(odometer, 2), (odometer, latitude, longitude))
+    return sorted(found.values())
 
 
 def _read_pdf(data: bytes):
@@ -2296,6 +2341,112 @@ def _point_at_arc_length(points, cumulative, distance, unproject):
     return unproject(*points[-1])
 
 
+def position_from_sheet(dig, pipeline=None) -> Optional[tuple]:
+    """Locate a dig from the coordinates printed on its own dig sheet.
+
+    The AGM rows carry an odometer and a position, and they bracket the
+    anomaly. Odometer increases downstream, so two of them give the dig's
+    position *and* the direction outright - nothing has to be assumed about
+    which way the line or the KMZ runs.
+
+    With a KMZ the path between the two anchors is followed along the
+    centerline, so a bend between them is accounted for. Without one the
+    straight line between them is used, which on these spacings is within a
+    few feet on a straight run and is flagged when the anchors are far apart.
+    """
+    anchors = getattr(dig, "sheet_anchors", None) or []
+    if len(anchors) < 2 or dig.odometer is None:
+        return None
+
+    odometer = float(dig.odometer)
+    before = [a for a in anchors if a[0] <= odometer]
+    after = [a for a in anchors if a[0] > odometer]
+    if before and after:
+        low, high = before[-1], after[0]
+    else:
+        # Outside the anchors: use the nearest pair and extrapolate along them.
+        low, high = anchors[0], anchors[1]
+        if not before:
+            low, high = anchors[0], anchors[1]
+        else:
+            low, high = anchors[-2], anchors[-1]
+
+    span = high[0] - low[0]
+    if span <= 0:
+        return None
+    fraction = (odometer - low[0]) / span
+
+    _, low_lat, low_lon = low
+    _, high_lat, high_lon = high
+
+    position = None
+    followed = False
+    if pipeline is not None and pipeline.lines:
+        position = _walk_centerline(
+            pipeline, (low_lon, low_lat), (high_lon, high_lat), fraction
+        )
+        followed = position is not None
+    if position is None:
+        position = (
+            low_lon + fraction * (high_lon - low_lon),
+            low_lat + fraction * (high_lat - low_lat),
+        )
+
+    longitude, latitude = position
+    along = odometer - low[0]
+    note = (
+        f"Position taken from the dig sheet's own AGM rows, {along:,.2f} ft "
+        f"past the one at odometer {low[0]:,.2f}"
+    )
+    if followed:
+        note += " following the KMZ centerline."
+    else:
+        # Straight-line interpolation. The pipe is never shorter than the
+        # chord between two points on it, so the gap between the two is a
+        # direct measure of how much bend is being ignored.
+        project, _ = _plane((low_lat + high_lat) / 2.0)
+        (x0, y0), (x1, y1) = project(low_lon, low_lat), project(high_lon, high_lat)
+        chord = math.hypot(x1 - x0, y1 - y0)
+        slack = span - chord
+        note += " (straight line between them"
+        if chord > 0 and slack > max(25.0, 0.01 * span):
+            note += (
+                f"; the pipe runs {slack:,.0f} ft longer than the straight "
+                f"line, so it bends between them - upload the KMZ to follow it"
+            )
+        note += ")."
+    return latitude, longitude, note
+
+
+def _walk_centerline(pipeline, start, end, fraction) -> Optional[tuple]:
+    """The point a given fraction of the way from ``start`` to ``end`` along
+    whichever centerline both of them sit on. None if neither line fits."""
+    project, unproject = _plane((start[1] + end[1]) / 2.0)
+    start_xy, end_xy = project(*start), project(*end)
+
+    best = None
+    for line in pipeline.lines:
+        if len(line) < 2:
+            continue
+        points, cumulative = _measure_line(line, project)
+        s0, off0 = _arc_length_of(points, cumulative, start_xy)
+        s1, off1 = _arc_length_of(points, cumulative, end_xy)
+        if s0 is None or s1 is None:
+            continue
+        score = (off0 or 0) + (off1 or 0)
+        if best is None or score < best[0]:
+            best = (score, points, cumulative, s0, s1)
+
+    # Both anchors have to actually be on this line, or following it is worse
+    # than the straight line between them.
+    if best is None or best[0] > 200.0:
+        return None
+    _, points, cumulative, s0, s1 = best
+    return _point_at_arc_length(
+        points, cumulative, s0 + fraction * (s1 - s0), unproject
+    )
+
+
 def position_from_pipeline(dig, pipeline) -> Optional[tuple]:
     """Locate a dig on the centerline from its two AGM references.
 
@@ -2376,13 +2527,22 @@ def position_from_pipeline(dig, pipeline) -> Optional[tuple]:
     return latitude, longitude, note
 
 
-def apply_pipeline_positions(digs, pipeline) -> list:
-    """Fill in coordinates for digs whose sheet carried none. Returns notes."""
+def apply_pipeline_positions(digs, pipeline=None) -> list:
+    """Fill in coordinates for digs whose anomaly row carried none.
+
+    The dig sheet's own AGM rows are tried first: they carry both an odometer
+    and a position, so they settle where the dig is and which way is
+    downstream without needing the KMZ at all. The KMZ is used to follow the
+    line's bends between them, and as a fallback for a sheet that prints no
+    coordinates anywhere.
+    """
     notes = []
     for dig in digs:
         if dig.ili_latitude is not None and dig.ili_longitude is not None:
             continue
-        placed = position_from_pipeline(dig, pipeline)
+        placed = position_from_sheet(dig, pipeline)
+        if placed is None:
+            placed = position_from_pipeline(dig, pipeline)
         if placed is None:
             continue
         dig.ili_latitude, dig.ili_longitude, note = placed
@@ -3712,11 +3872,13 @@ if st.button("Read uploads", type="primary", disabled=not ready):
         except Exception as error:  # noqa: BLE001
             problems.append(f"{kmz_file.name}: {error}")
 
-    # Order matters: the KMZ can supply a coordinate for a dig whose sheet
-    # printed none, and that coordinate is then what the county lookup uses.
+    # Order matters: a dig whose anomaly row printed no coordinate is located
+    # from its sheet's own AGM rows (and the KMZ, when one is uploaded, to
+    # follow the line's bends), and that position is then what the county
+    # lookup uses.
     placements = []
-    if pipeline is not None:
-        with st.status("Locating digs on the centerline…", expanded=False):
+    if any(d.ili_latitude is None for d in digs):
+        with st.status("Locating digs…", expanded=False):
             placements = apply_pipeline_positions(digs, pipeline)
 
     if lookup_county:
