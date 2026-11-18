@@ -4048,7 +4048,27 @@ def _encode_for_slot(png_bytes: bytes, slot, extension: str = "") -> bytes:
 
 st.set_page_config(page_title="ONEOK Dig File Generator", page_icon="⛽", layout="wide")
 
-STATE_KEYS = ["digs", "sheets", "pipeline", "outputs"]
+def upload_signature(dig_files, alignment_files, kmz_file, lookup_county) -> tuple:
+    """What the parse depends on, so a re-read happens only when it changes.
+
+    Streamlit reruns the whole script on every interaction - each checkbox,
+    each cell edited in the review table. Keying the read on the uploads
+    themselves means those reruns do not set the parse going again and wipe
+    out corrections that were just typed in.
+    """
+    def stamp(upload):
+        return (upload.name, getattr(upload, "size", None))
+
+    return (
+        tuple(stamp(u) for u in dig_files or []),
+        tuple(stamp(u) for u in alignment_files or []),
+        stamp(kmz_file) if kmz_file is not None else None,
+        bool(lookup_county),
+    )
+
+
+STATE_KEYS = ["digs", "sheets", "pipeline", "outputs",
+              "read_signature", "read_notes", "placements", "diagnostics"]
 for key in STATE_KEYS:
     st.session_state.setdefault(key, None)
 
@@ -4156,8 +4176,23 @@ if not ready:
 # ---------------------------------------------------------------------------
 # Read the uploads
 # ---------------------------------------------------------------------------
+# The sheets are read as soon as they are uploaded, so the review table below
+# is there to correct before Generate is pressed. Re-reading is keyed on what
+# was actually uploaded, so Streamlit's reruns - every checkbox, every cell
+# edited in the table - do not set the whole parse going again.
 
-if st.button("Read uploads", type="primary", disabled=not ready):
+read_signature = upload_signature(
+    dig_files, alignment_files, kmz_file, lookup_county
+)
+
+if ready and st.session_state.get("read_signature") != read_signature:
+    st.session_state.read_signature = read_signature
+    # Anything typed into the table survives the re-read.
+    old_notes = {
+        (d.source_file, d.name): d.notes
+        for d in (st.session_state.digs or []) if d.notes
+    }
+
     digs = []
     problems = []
     diagnostics = []
@@ -4229,25 +4264,33 @@ if st.button("Read uploads", type="primary", disabled=not ready):
                 problems.extend(apply_geocoded_county(digs, token))
 
     digs.sort(key=lambda d: (d.source_file, d.odometer or 0))
+    for dig in digs:
+        dig.notes = old_notes.get((dig.source_file, dig.name), "")
+
     st.session_state.digs = digs
     st.session_state.sheets = sheets
     st.session_state.pipeline = pipeline
     st.session_state.outputs = None
+    # Kept in state so they stay on screen through the reruns that every table
+    # edit causes, instead of flashing once and vanishing.
+    st.session_state.read_notes = problems
+    st.session_state.placements = placements
+    st.session_state.diagnostics = diagnostics
 
-    for problem in problems:
-        st.warning(problem)
+for problem in st.session_state.read_notes or []:
+    st.warning(problem)
 
-    for note in placements:
-        st.caption(note)
+for note in st.session_state.placements or []:
+    st.caption(note)
 
-    if diagnostics:
-        with st.expander("What the parser saw in those PDFs", expanded=True):
-            st.caption(
-                "Send this to Claude and the parser can be corrected against "
-                "your actual sheet without guessing."
-            )
-            for report in diagnostics:
-                st.json(report)
+if st.session_state.diagnostics:
+    with st.expander("What the parser saw in those PDFs", expanded=True):
+        st.caption(
+            "Send this to Claude and the parser can be corrected against "
+            "your actual sheet without guessing."
+        )
+        for report in st.session_state.diagnostics:
+            st.json(report)
 
 
 digs = st.session_state.digs or []

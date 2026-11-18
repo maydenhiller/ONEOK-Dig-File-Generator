@@ -54,6 +54,12 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+The dig sheets are read as soon as they are uploaded — there is no "Read
+uploads" step. Correct anything in the review table, then press **Generate
+files** once and download the zip. Re-reading is keyed on the uploads
+themselves, so editing a cell does not restart the parse and throw the
+correction away; notes typed into the table survive a genuine re-read.
+
 ### Mapbox token
 
 Directions and Mapbox satellite imagery both need a token. Copy
