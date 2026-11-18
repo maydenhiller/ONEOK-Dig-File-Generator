@@ -1510,13 +1510,20 @@ def parse_digsheet(data: bytes, filename: str) -> list[Dig]:
 
 STATION_RE = re.compile(r"\b(\d{1,5})\+(\d{2})\b")
 RANGE_RE = re.compile(r"From\s+(\d{1,5}\+\d{2})\s+To\s+(\d{1,5}\+\d{2})", re.I)
-PIPELINE_RE = re.compile(r"Pipeline\s+Number:?\s*(\d+)", re.I)
-SHEET_RE = re.compile(r"Sheet\s+(\d+)\s+of\s+(\d+)", re.I)
+PIPELINE_RE = re.compile(r"Pipeline\s*Number:?\s*(\d+)", re.I)
+SHEET_RE = re.compile(r"Sheet\s*(\d+)\s*of\s*(\d+)", re.I)
 COUNTY_RE = re.compile(r"([A-Z][A-Z .'\-]{1,30}?)\s+COUNTY\b\s*,\s*([A-Z][A-Z ]+)")
 # The sheets carry a "COUNTY" row label as well as the county name, and the two
 # can extract onto one line.
 FILENAME_SHEET_RE = re.compile(r"(\d{4,6})[_\-](\d{1,3})\b")
 PLSS_RE = re.compile(r"T\s*(\d+)\s*([NS])\s*,\s*R\s*(\d+)\s*([EW])\s*,\s*SEC\s*(\d+)", re.I)
+
+# Newer sheets carry no PLSS band at all. The section is written in a white box
+# drawn on the satellite imagery instead, section first and the other way round:
+# "SEC 27, T16N-R23W". Same information, different order and punctuation.
+PLAN_PLSS_RE = re.compile(
+    r"SEC\s*(\d+)\s*,\s*T\s*(\d+)\s*([NS])\s*[-‐-―,]\s*R\s*(\d+)\s*([EW])", re.I
+)
 ROUTE_RE = re.compile(r"\((\d{4,6}(?:-\d+)?)\)\s*([A-Za-z].*)")
 
 
@@ -1549,6 +1556,15 @@ class CountySegment(BandSegment):
 @dataclass
 class PlssSegment(BandSegment):
     section: str = ""
+    # True when the section came from the labels drawn on the imagery rather
+    # than from a PLSS band. Those sheets draw no dividers around each section,
+    # so the boundary between two labels is taken as the midpoint between them.
+    # Only the ends SHARED with another label are inferred - where a segment
+    # runs to the edge of the sheet, that end is the sheet's own limit and is
+    # as solid as any other.
+    boundary_inferred: bool = False
+    low_inferred: bool = False
+    high_inferred: bool = False
 
 
 @dataclass
@@ -1643,7 +1659,7 @@ def parse_alignment_sheet(data: bytes, filename: str) -> AlignmentSheet:
         text = page.extract_text() or ""
         words = page.extract_words(keep_blank_chars=False)
 
-        _read_title_block(sheet, text, words, page.width, page.height)
+        _read_title_block(sheet, text, words, page.width, page.height, page)
 
         axis = _station_axis(words)
         if axis is None:
@@ -1656,6 +1672,10 @@ def parse_alignment_sheet(data: bytes, filename: str) -> AlignmentSheet:
         bands = _bands(page, words)
         _read_counties(sheet, page, bands, anchors, plan)
         _read_plss(sheet, page, bands, anchors, plan)
+        if not sheet.plss:
+            # Newer sheets have no PLSS band; the sections are labelled on the
+            # imagery instead.
+            _read_plan_plss(sheet, page, anchors, plan)
         _read_hca(sheet, page, bands, words, anchors, plan)
 
     return sheet
@@ -1784,26 +1804,87 @@ def _station_range(anchors, x_low, x_high):
     return min(a, b), max(a, b)
 
 
-def _read_title_block(sheet, text, words, page_width, page_height):
+def _respaced_text(page) -> str:
+    """The page's text with spaces put back where the glyphs imply them.
+
+    Newer sheets encode no space characters at all - the title block comes out
+    as "PipelineNumber:10167" and "(10167)AntelopeHillstoLeedey3in". The gaps
+    are still there in the glyph positions (effectively zero inside a word,
+    about half a character between words), so the spaces can be restored from
+    geometry rather than guessed at from the letters.
+    """
+    lines: dict = {}
+    for char in page.chars:
+        if not char.get("upright", True):
+            continue
+        key = None
+        for existing in lines:
+            if abs(existing - char["top"]) <= 1.5:
+                key = existing
+                break
+        if key is None:
+            key = char["top"]
+            lines[key] = []
+        lines[key].append(char)
+
+    out = []
+    for top in sorted(lines):
+        chars = sorted(lines[top], key=lambda c: c["x0"])
+        widths = [c["x1"] - c["x0"] for c in chars if c["x1"] > c["x0"]]
+        if not widths:
+            continue
+        widths.sort()
+        median = widths[len(widths) // 2]
+        threshold = max(0.5, median * 0.35)
+        parts = []
+        previous = None
+        for char in chars:
+            if previous is not None and (char["x0"] - previous["x1"]) > threshold:
+                parts.append(" ")
+            parts.append(char["text"])
+            previous = char
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
+def _read_title_block(sheet, text, words, page_width, page_height, page=None):
     """Route name, pipeline and sheet numbers off the title block.
 
     The station range is NOT read here. Real sheets do not always carry a
     "From X To Y" line, and the axis ticks give a better answer anyway.
     """
-    match = RANGE_RE.search(text)
+    # Sheets that encode no spaces need the glyph gaps put back first. The
+    # direct read is tried first so a normal sheet is unaffected.
+    fallback = _respaced_text(page) if page is not None else ""
+
+    def first(pattern, group=1):
+        for source in (text, fallback):
+            if not source:
+                continue
+            found = pattern.search(source)
+            if found:
+                return found.group(group), found
+        return None, None
+
+    match = RANGE_RE.search(text) or (RANGE_RE.search(fallback) if fallback else None)
     if match:
         sheet.station_start = station_to_feet(match.group(1))
         sheet.station_end = station_to_feet(match.group(2))
 
-    match = PIPELINE_RE.search(text)
-    if match:
-        sheet.pipeline_number = match.group(1)
+    value, _ = first(PIPELINE_RE)
+    if value:
+        sheet.pipeline_number = value
 
-    match = SHEET_RE.search(text)
-    if match:
-        sheet.sheet_number = match.group(1)
+    value, _ = first(SHEET_RE)
+    if value:
+        sheet.sheet_number = value
 
-    sheet.route_name = _find_route_name(text, words, page_width, page_height)
+    route = _find_route_name(text, words, page_width, page_height)
+    if route == UNKNOWN or " " not in route:
+        spaced = _find_route_name(fallback, words, page_width, page_height)
+        if spaced != UNKNOWN and (route == UNKNOWN or " " in spaced):
+            route = spaced
+    sheet.route_name = route
 
 
 def _find_route_name(text, words, page_width, page_height) -> str:
@@ -1970,6 +2051,107 @@ def _read_plss(sheet, page, bands, anchors, plan) -> None:
         ))
 
 
+def _read_plan_plss(sheet, page, anchors, plan) -> None:
+    """Sections read from the white boxes drawn on the satellite imagery.
+
+    Newer ONEOK sheets carry no PLSS band. Each section is named in a box on
+    the plan view instead, written "SEC 27, T16N-R23W".
+
+    Those boxes sit roughly over the stretch they describe, but nothing is
+    drawn around them to bound it - the band version has dividers, this does
+    not. So the boundary between two adjacent sections is taken as the midpoint
+    between their labels, and any segment produced this way is marked
+    ``boundary_inferred`` so a dig that lands near a boundary can be flagged
+    rather than silently trusted.
+    """
+    words = page.extract_words(keep_blank_chars=False)
+    low, high = plan
+
+    found = []
+    for line in _cluster_lines(
+        [w for w in words if low - 40 <= w["x0"] <= high + 40], tolerance=3.0
+    ):
+        joined = " ".join(w["text"] for w in line)
+        for match in PLAN_PLSS_RE.finditer(joined):
+            section, township, ns, rng, ew = match.groups()
+            label = (
+                f"T {township}{ns.upper()}, R {rng}{ew.upper()}, SEC {section}"
+            )
+            centre = _locate_sec_label(line, section)
+            if centre is None:
+                continue
+            found.append((centre, label, section))
+
+    if not found:
+        return
+
+    # One entry per label, left to right.
+    found.sort(key=lambda item: item[0])
+    deduped = []
+    for centre, label, section in found:
+        if deduped and deduped[-1][1] == label:
+            continue
+        deduped.append((centre, label, section))
+
+    for index, (centre, label, section) in enumerate(deduped):
+        first, last = index == 0, index == len(deduped) - 1
+        left = low if first else (deduped[index - 1][0] + centre) / 2.0
+        right = high if last else (centre + deduped[index + 1][0]) / 2.0
+        station_low, station_high = _station_range(anchors, left, right)
+        # The station axis can run either way across the page, so which drawn
+        # edge became the low station is not fixed - work it out rather than
+        # assuming left is low.
+        left_station = _station_at(anchors, left)
+        right_station = _station_at(anchors, right)
+        left_is_low = (
+            left_station is not None and right_station is not None
+            and left_station <= right_station
+        )
+        left_inferred, right_inferred = not first, not last
+        sheet.plss.append(PlssSegment(
+            label=label,
+            station_low=station_low,
+            station_high=station_high,
+            section=section,
+            boundary_inferred=len(deduped) > 1,
+            low_inferred=left_inferred if left_is_low else right_inferred,
+            high_inferred=right_inferred if left_is_low else left_inferred,
+        ))
+
+    # The labels sit inside the drawing, so the outermost ones stop short of
+    # the sheet's own first and last station. Stretch them to the sheet's
+    # limits, or a dig near either edge falls in no section and comes out
+    # Unknown even though the sheet plainly says which one it is.
+    placed = [s for s in sheet.plss
+              if s.station_low is not None and s.station_high is not None]
+    if placed and sheet.station_start is not None and sheet.station_end is not None:
+        first_station = min(sheet.station_start, sheet.station_end)
+        last_station = max(sheet.station_start, sheet.station_end)
+        lowest = min(placed, key=lambda s: s.station_low)
+        highest = max(placed, key=lambda s: s.station_high)
+        lowest.station_low = min(lowest.station_low, first_station)
+        highest.station_high = max(highest.station_high, last_station)
+
+
+def _locate_sec_label(line, section: str) -> Optional[float]:
+    """The centre x of the "SEC <n>" pair that starts one plan label."""
+    for index, word in enumerate(line):
+        if word["text"].upper().strip(",") != "SEC":
+            continue
+        if index + 1 < len(line):
+            following = line[index + 1]["text"].strip().strip(",")
+            if following == section:
+                return (word["x0"] + line[index + 1]["x1"]) / 2.0
+        # Some sheets set the whole label as one word: "SEC 27, T16N-R23W".
+        if PLAN_PLSS_RE.match(word["text"]):
+            return (word["x0"] + word["x1"]) / 2.0
+    for word in line:
+        match = PLAN_PLSS_RE.match(word["text"])
+        if match and match.group(1) == section:
+            return (word["x0"] + word["x1"]) / 2.0
+    return None
+
+
 def _matching_span(spans, centre, plan):
     for low, high in spans:
         if low <= centre <= high:
@@ -1977,42 +2159,169 @@ def _matching_span(spans, centre, plan):
     return plan
 
 
+def _label_gutter(page, band) -> float:
+    """Right edge of the box holding a band's row name, down the left side.
+
+    Anything left of this is the label, not the drawing.
+    """
+    candidates = [
+        edge["x0"] for edge in list(page.lines) + list(page.edges)
+        if abs(edge["x1"] - edge["x0"]) < 1.5
+        and edge["top"] <= band["top"] + 2
+        and edge["bottom"] >= band["bottom"] - 2
+        and edge["x0"] < page.width * 0.2
+    ]
+    return max(candidates) + 1.0 if candidates else 45.0
+
+
+def _rotated_station_labels(page, band) -> list:
+    """(x, station feet) for the sideways station labels printed in a band.
+
+    These sheets print the exact start and end station of every HCA stretch,
+    rotated, at the ends of its bar. Reading them is better than converting the
+    bar's pixel extent through the axis fit: it is the sheet's own number, so
+    the range comes out exact instead of within a few feet.
+    """
+    columns: dict = {}
+    for char in page.chars:
+        if char.get("upright"):
+            continue
+        if not (band["top"] - 4 <= char["top"] <= band["bottom"] + 4):
+            continue
+        columns.setdefault(round(char["x0"], 0), []).append(char)
+
+    labels = []
+    for x in sorted(columns):
+        text = "".join(
+            c["text"] for c in sorted(columns[x], key=lambda c: -c["top"])
+        ).strip()
+        if STATION_RE.fullmatch(text):
+            feet = station_to_feet(text)
+            if feet is not None:
+                labels.append((float(x), feet))
+    return labels
+
+
+def _snap_to_label(labels, x, tolerance: float = 22.0) -> Optional[int]:
+    """The station printed nearest this x, if one is close enough to be its."""
+    best, best_gap = None, None
+    for label_x, feet in labels:
+        gap = abs(label_x - x)
+        if gap <= tolerance and (best_gap is None or gap < best_gap):
+            best, best_gap = feet, gap
+    return best
+
+
+def _is_hca_colour(colour) -> bool:
+    """The colour ONEOK draws an HCA stretch in.
+
+    Older sheets draw it yellow (1, 1, 0) over a dark rule; newer ones draw it
+    green (0.333, 1, 0). Both are 'high green, low blue', which no border,
+    divider or grey rule on these sheets is.
+    """
+    if not colour:
+        return False
+    try:
+        values = [float(v) for v in colour]
+    except (TypeError, ValueError):
+        return False
+    if len(values) != 3:
+        return False
+    red, green, blue = values
+    return green >= 0.6 and blue <= 0.4 and red <= green
+
+
 def _read_hca(sheet, page, bands, words, anchors, plan) -> None:
     """The HCA band.
 
-    HCA stretches are drawn as thin horizontal rules on the HCA row, not as
-    filled blocks. When the row is found and carries no rules, the sheet is
-    saying there is no HCA here - which is a reliable "No", not "Unknown".
-    """
-    label = None
-    for word in words:
-        if word["x0"] < 70 and word["text"].strip().upper() == "HCA":
-            label = word
-            break
-    if label is None:
-        return
+    HCA stretches are drawn as coloured horizontal rules on the HCA row, not
+    as filled blocks. Where they sit within the band differs by sheet
+    generation - older sheets put them on the HCA label's own line, newer ones
+    well above it - so they are found by colour anywhere in the band rather
+    than by their height on the page. Anchoring on the label's line alone made
+    a sheet with three plainly marked HCA stretches report a confident "No".
 
-    # Strictly within the label's own line: the band's border rules sit just
-    # outside it and span the full width, and counting one of those as an HCA
-    # mark makes the whole sheet look like HCA.
-    top = label["top"]
-    bottom = label["bottom"]
+    When the band is found and carries no coloured rule, the sheet is saying
+    there is no HCA here - a reliable "No", not "Unknown".
+    """
+    band = _band_named(bands, "HCA")
     plan_width = plan[1] - plan[0]
 
     ranges = []
-    for edge in list(page.lines) + list(page.edges) + list(page.rects):
-        if abs(edge["bottom"] - edge["top"]) > 1.5:
-            continue
-        if not (top <= edge["top"] <= bottom):
-            continue
-        width = edge["x1"] - edge["x0"]
-        if width < 5 or width > plan_width * 0.98:
-            continue
-        if edge["x1"] < plan[0] - 40 or edge["x0"] > plan[1] + 40:
-            continue
-        low, high = _station_range(anchors, edge["x0"], edge["x1"])
-        if low is not None:
-            ranges.append((low, high))
+    if band is not None:
+        gutter = _label_gutter(page, band)
+        printed = _rotated_station_labels(page, band)
+
+        # Each stretch is captioned "HCA" with its start and end station
+        # printed sideways either side of it. That pairing is the sheet's own
+        # statement of the range and beats measuring the drawn bar: on
+        # 10167_016 one bar runs straight across the gap between two separate
+        # stretches, while the captions and the printed stations agree there
+        # are two.
+        captions = [
+            (word["x0"] + word["x1"]) / 2.0
+            for word in words
+            if word["text"].strip().upper() == "HCA"
+            and band["top"] - 2 <= word["top"] <= band["bottom"] + 2
+            and word["x0"] >= gutter
+        ]
+        for centre in captions:
+            before = [feet for x, feet in printed if x <= centre]
+            after = [feet for x, feet in printed if x >= centre]
+            if not before or not after:
+                continue  # the legend's own "HCA" has no stations around it
+            low, high = before[-1], after[0]
+            if low != high:
+                ranges.append((min(low, high), max(low, high)))
+
+        if not ranges:
+            # No captions, or no printed stations: measure the coloured bars.
+            for edge in list(page.lines) + list(page.edges) + list(page.rects):
+                if abs(edge["bottom"] - edge["top"]) > 1.5:
+                    continue
+                if not (band["top"] - 1 <= edge["top"] <= band["bottom"] + 1):
+                    continue
+                if not _is_hca_colour(
+                    edge.get("stroking_color")
+                ) and not _is_hca_colour(edge.get("non_stroking_color")):
+                    continue
+                if (edge["x1"] - edge["x0"]) < 1.5:
+                    continue
+                if edge["x0"] < gutter:
+                    continue
+                low = _snap_to_label(printed, edge["x0"])
+                high = _snap_to_label(printed, edge["x1"])
+                if low is None or high is None or low == high:
+                    low, high = _station_range(anchors, edge["x0"], edge["x1"])
+                if low is not None and high is not None:
+                    ranges.append((min(low, high), max(low, high)))
+
+    if not ranges:
+        # Fallback for a sheet that draws the row uncoloured: rules strictly on
+        # the HCA label's own line, excluding the band's full-width borders.
+        label = None
+        for word in words:
+            if word["x0"] < 70 and word["text"].strip().upper() == "HCA":
+                label = word
+                break
+        if label is None and band is None:
+            return
+        if label is not None:
+            for edge in list(page.lines) + list(page.edges) + list(page.rects):
+                if abs(edge["bottom"] - edge["top"]) > 1.5:
+                    continue
+                if not (label["top"] <= edge["top"] <= label["bottom"]):
+                    continue
+                width = edge["x1"] - edge["x0"]
+                if width < 5 or width > plan_width * 0.98:
+                    continue
+                if edge["x1"] < plan[0] - 40 or edge["x0"] > plan[1] + 40:
+                    continue
+                low, high = _station_range(anchors, edge["x0"], edge["x1"])
+                if low is not None:
+                    ranges.append((low, high))
+        elif band is None:
+            return
 
     sheet.hca_reliable = True
     if not ranges:
@@ -2088,6 +2397,17 @@ def apply_alignment(dig, sheets) -> None:
         dig.legal_description = segment.label
         # On every filled report checked, Tract Number equals the PLSS section.
         dig.tract_number = segment.section
+        if segment.boundary_inferred:
+            edge = _distance_to_segment_edge(segment, dig.station_ft)
+            if edge is not None and edge <= 500:
+                dig.warnings.append(
+                    f"This sheet labels its sections on the imagery rather "
+                    f"than in a PLSS band, so the boundary is taken as the "
+                    f"midpoint between labels. Station "
+                    f"{feet_to_station(dig.station_ft)} is only "
+                    f"{edge:,.0f} ft from that boundary - check SEC "
+                    f"{segment.section} against the sheet."
+                )
     elif len(sheet.plss) > 1:
         dig.warnings.append(
             "Alignment sheet spans more than one PLSS section and the station "
@@ -2098,6 +2418,23 @@ def apply_alignment(dig, sheets) -> None:
     if hca == UNKNOWN and dig.hca_from_digsheet:
         hca = dig.hca_from_digsheet
     dig.hca = hca
+
+
+def _distance_to_segment_edge(segment, station_ft) -> Optional[float]:
+    """Feet to the nearer *inferred* end of the segment holding this station.
+
+    Only the ends shared with another label count. Where a segment runs to the
+    edge of the sheet, that end is the sheet's own limit, not a guess, so a dig
+    near it should not be flagged.
+    """
+    if station_ft is None:
+        return None
+    candidates = []
+    if getattr(segment, "low_inferred", False) and segment.station_low is not None:
+        candidates.append(abs(station_ft - segment.station_low))
+    if getattr(segment, "high_inferred", False) and segment.station_high is not None:
+        candidates.append(abs(segment.station_high - station_ft))
+    return float(min(candidates)) if candidates else None
 
 
 def _apply_line_level(dig, sheets) -> None:

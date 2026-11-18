@@ -18,8 +18,8 @@ image dropped into the report's image slot.
 | Upstream / downstream reference and feet to AGM | The two reference cells, whether they name an AGM or a launch/receive valve |
 | Line name | Alignment sheet title block |
 | Alignment sheet number | Pipeline number + sheet number off the alignment sheet |
-| Tract number, legal description | Alignment sheet PLSS band, matched to the dig's station |
-| HCA | Alignment sheet HCA band, falling back to the dig sheet's Is HCA column |
+| Tract number, legal description | The alignment sheet's PLSS band, or the section labels drawn on its imagery when it has no band — matched to the dig's station |
+| HCA | The alignment sheet's HCA captions and their printed stations, falling back to the dig sheet's Is HCA column |
 | Directions | Mapbox, using the same logic as the Dig Site Directions Generator |
 | Aerial image | Satellite tiles + the uploaded KMZ centerline and placemarks |
 | Dig position | The anomaly row's ILI coordinate; failing that, interpolated by odometer between the AGM rows on the same sheet (following the KMZ centerline when one is uploaded) |
@@ -137,6 +137,25 @@ packages.txt        apt packages for Streamlit Cloud (fonts)
   filled report checked (NL3DH-24-F1 → 16, STSB-24-F1 → 6, RJSJ-25-F1 → 7).
   If your tract numbering ever diverges from the section, correct it in the
   review table before generating.
+- **There are two generations of alignment sheet, and the section is in a
+  different place on each.** Older sheets (10171_032, 10222_41) carry a PLSS
+  band down the left edge, written `T 19N, R 16W, SEC 6`. Newer ones (10167,
+  10173) have no PLSS band at all — each section is named in a white box drawn
+  on the satellite imagery, written the other way round: `SEC 27, T16N-R23W`.
+  Both are read, and the band wins where a sheet has one.
+
+  Nothing is drawn around the plan labels to bound them — the band version has
+  dividers, this does not — so the boundary between two adjacent sections is
+  taken as the midpoint between their labels. A dig landing within 500 ft of
+  one of those inferred boundaries is flagged to be checked against the sheet
+  rather than silently trusted. Where a section runs to the edge of the sheet,
+  that end is the sheet's own limit and is not flagged.
+
+  Checked on nine real sheets. The strongest evidence that the midpoint rule
+  places sections correctly is that **consecutive sheets agree at their
+  joins**: 10167_009 ends in SEC 26 and 010 begins in SEC 26, 016 ends in
+  SEC 36 and 017 begins in SEC 36, 017 ends in SEC 31 and 018 begins in
+  SEC 31. A misplaced boundary would show up as a mismatch at a join.
 - **PDF cells are read in content-stream order, not by position.** These
   sheets are printed from Excel with text overflowing its columns, so a
   reference cell and the number beside it physically overlap in x. Sorting
@@ -158,9 +177,33 @@ packages.txt        apt packages for Streamlit Cloud (fonts)
   down the left edge (COUNTY, PLSS, CLASS, HCA). Within a band, the drawn
   vertical dividers bound each segment, and a segment's station range comes
   from the axis-tick regression — so a station falls in the section it is
-  actually drawn in, rather than the nearest label. HCA stretches are thin
-  horizontal rules on the HCA row, not filled blocks; when the row is present
-  and carries none, that is a reliable "No".
+  actually drawn in, rather than the nearest label.
+- **HCA comes from the sheet's own captions, not from the drawn bar.** Each
+  stretch is captioned `HCA` with its start and end station printed sideways
+  either side of it, so the range comes out exact. Measuring the bar is the
+  fallback, and it is genuinely worse: on 10167_016 one bar is drawn straight
+  across the gap between two separate stretches, while the captions and the
+  printed stations both agree there are two.
+
+  Where a sheet carries no captions (the older generation), the coloured rules
+  are measured instead — yellow `(1, 1, 0)` on older sheets, green
+  `(0.333, 1, 0)` on newer ones. Colour is what identifies them; the HCA
+  label's own text line is not, because newer sheets draw the marks well above
+  it. Anchoring on that line made 10167_009 — which carries three plainly
+  marked HCA stretches — report a confident **"No"**, which on a safety field
+  is worse than Unknown. When the row is present and genuinely carries
+  nothing, that is still a reliable "No".
+- **Newer sheets encode no space characters at all.** The title block extracts
+  as `PipelineNumber:10167` and `(10167)AntelopeHillstoLeedey3in`. The gaps are
+  still in the glyph positions — effectively zero inside a word, about a third
+  of a character between words — so the spaces are restored from geometry
+  before the title block is read. A sheet with real spaces is parsed directly
+  and never goes near that path.
+- **County cannot be read from a newer sheet at all.** The county name is drawn
+  into the satellite raster (`Roger Mills, OK` is part of the image, not text),
+  and those sheets carry no COUNTY band either. County and State come from the
+  coordinate lookup instead, which is why that fallback matters rather than
+  being a nicety.
 - The station range comes from the axis tick row, not from every
   station-shaped token on the page — real sheets often have no "From X To Y"
   line, and stray tokens produce a nonsense range.
