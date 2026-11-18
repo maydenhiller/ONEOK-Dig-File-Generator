@@ -171,6 +171,19 @@ packages.txt        apt packages for Streamlit Cloud (fonts)
 - **Stationing direction** is detected from each dig sheet's own odometer and
   stationing columns, so mixed batches across ascending and descending lines
   come out right in one run.
+- **Dig names are not always `-F<n>`.** `RBB-26-P1`..`P4` are pigs, and a
+  name can carry a letter suffix (`MLT-25-F19B`) that is part of the name —
+  the same sheet also holds `MLT-25-F19`, a different dig. The pattern is
+  `<prefix>-<yy>-<letters><number><optional letter>`, still guarded against
+  running into the feature id printed next to it.
+- **Column detection is advisory, not authoritative.** The wrapped header
+  merges differently from sheet to sheet, so neighbouring fields land in one
+  cell (odometer and stationing together, the weld distances and both AGM
+  references swallowed into MOP) or a column is missed entirely. The anchored
+  text patterns read the same row correctly because the column *order* is
+  fixed even when the header is not readable, so they fill any field whose
+  detected cell cannot yield a usable value. A sheet whose columns were read
+  cleanly is unaffected.
 - **PDF dig sheets**: the anomaly row must satisfy all three conditions at
   once — it starts with a dig name (a value in the leftmost Dig Number column),
   that name matches the heading at the top centre of page one, and the row sits
@@ -198,3 +211,16 @@ ascending and descending lines comes out right in one run whichever template
 was used; picking the matching one just means the sheet also reads the way
 that line's crew expects. If only one template is uploaded, that one is used
 and the app says so.
+
+## When a sheet carries no coordinates
+
+Some dig sheets print ILI Latitude/Longitude only on the AGM rows, not on the
+anomaly row (the RBB and MLT sheets are like this). There is then no dig
+coordinate, so the aerial image and the driving directions cannot be built and
+the app says so per dig rather than inventing a position. Everything else on
+the report still fills in.
+
+County and State are written on every report, `Unknown` included. Leaving the
+cell untouched would keep whatever the template shipped with — the previous
+line's county — and a wrong county in a signed report is worse than a blank
+one.

@@ -802,12 +802,20 @@ _HEADER_TOKENS = {
     "flag", "is", "hca", "vendor", "called", "previous",
 }
 
-# Dig names look like NL3DH-24-F1, H64M-26-F11, STSB-24-F1, RJSJ-25-F1.
-DIG_NAME_RE = re.compile(r"\b([A-Z0-9]{2,10}-\d{2}-F\d{1,3})\b")
+# Dig names look like NL3DH-24-F1, H64M-26-F11, STSB-24-F1, RJSJ-25-F1,
+# RBB-26-P1 and MLT-25-F19B.
+#
+# The letter in the last group is NOT always F - RBB-26-P1..P4 are pigs ("P").
+# The number can also carry a letter suffix where one anomaly was split into
+# two digs (MLT-25-F19 and MLT-25-F19B), and the suffix is part of the name:
+# F19 and F19B are different digs on the same sheet.
+DIG_NAME_BODY = r"[A-Z0-9]{2,10}-\d{2}-[A-Z]{1,2}\d{1,3}[A-Z]?"
+
+DIG_NAME_RE = re.compile(rf"\b({DIG_NAME_BODY})\b")
 
 # Anchored at the start of a cell, and guarded against running into the
 # feature id that follows it ("NL3DH-24-F9" then "40116291").
-DIG_NAME_LEAD_RE = re.compile(r"^([A-Z0-9]{2,10}-\d{2}-F\d{1,3})(?![0-9])")
+DIG_NAME_LEAD_RE = re.compile(rf"^({DIG_NAME_BODY})(?![0-9])")
 
 STATION_TOKEN_RE = re.compile(r"\b\d{1,5}\+\d{2}\b")
 TWO_DP_RE = re.compile(r"\b\d{1,7}\.\d{2}\b")
@@ -836,15 +844,21 @@ def parse_pdf_digsheet(data: bytes, source_file: str) -> list[Dig]:
     """
     rows, heading, bands, columns = _read_pdf(data)
 
-    # With columns, the cells are authoritative. The text patterns are only a
-    # fallback for a sheet whose header could not be read - running them over
-    # a positionally-sorted row would reintroduce the interleaving problem.
-    if not columns:
-        for row in rows:
-            parsed = _parse_row_text(row["_raw"])
-            for key, value in parsed.items():
-                if value:
-                    row[key] = value
+    # Column detection is per-sheet and unreliable: the wrapped header merges
+    # differently from one sheet to the next, so neighbouring fields land in
+    # one cell ("44338.58 441+56" in Odometer, the weld distances and both AGM
+    # references swallowed into MOP) or a column is missed entirely. The
+    # anchored text patterns read the same row correctly because the column
+    # ORDER is fixed even when the header is unreadable.
+    #
+    # So the patterns run for every row, and a text value is used wherever the
+    # cell the columns produced cannot yield a usable value. A sheet whose
+    # columns were read cleanly is therefore untouched by this.
+    for row in rows:
+        parsed = _parse_row_text(row["_raw"])
+        for key, value in parsed.items():
+            if value and not _usable(key, row.get(key)):
+                row[key] = value
 
     anomalies, _ = _select_anomaly_rows(rows, heading, bands)
     if not anomalies:
@@ -1201,6 +1215,34 @@ def _in_band(row, bands) -> bool:
         if top - 2.0 <= row.get("_top", -1) <= bottom + 2.0:
             return True
     return False
+
+
+_TEXT_NUMERIC_KEYS = {
+    "odometer", "us_weld_distance", "ds_weld_distance",
+    "us_agm_distance", "ds_agm_distance", "latitude", "longitude",
+}
+
+
+def _usable(key: str, value) -> bool:
+    """Can the cell the columns produced yield a value for this field?
+
+    A merged cell such as ``"44338.58 441+56"`` is not a number and not a
+    station, so it is worth nothing downstream - the anchored text value
+    replaces it. A cell that converts cleanly is left alone, which is what
+    keeps a correctly-read sheet unaffected.
+    """
+    if value is None or str(value).strip() == "":
+        return False
+    if key in _TEXT_NUMERIC_KEYS:
+        return _to_float(value) is not None
+    if key == "station":
+        return station_to_feet(value) is not None
+    if key in ("us_agm_ref", "ds_agm_ref"):
+        # A reference cell that swallowed the fields after it carries more than
+        # one reference, or trails a distance. Both make it unusable as a name.
+        text = _clean(value) or ""
+        return bool(HAS_LETTER_RE.search(text)) and len(STATION_TOKEN_RE.findall(text)) <= 1
+    return True
 
 
 def _parse_row_text(text: str) -> dict:
@@ -3116,10 +3158,12 @@ def build_staking_report(
     if settings.write_line_name and dig.line_name and dig.line_name != UNKNOWN:
         values["J2"] = dig.line_name
     if settings.write_county_state:
-        if dig.county and dig.county != UNKNOWN:
-            values["C22"] = dig.county
-        if dig.state and dig.state != UNKNOWN:
-            values["C23"] = dig.state
+        # Always written, Unknown included. Leaving the cell alone keeps
+        # whatever the template shipped with - the last line's county - and a
+        # wrong county in a signed report is worse than a blank one. This
+        # matches how C19-C21 and C24 already behave.
+        values["C22"] = dig.county or UNKNOWN
+        values["C23"] = dig.state or UNKNOWN
     if settings.surveyor_name:
         # C11 only. The phone number in C12 is an XLOOKUP against the template's
         # own employee table, keyed off this name - writing C12 would replace
