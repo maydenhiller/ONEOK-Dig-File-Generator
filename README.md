@@ -14,7 +14,7 @@ image dropped into the report's image slot.
 | --- | --- |
 | Dig name, ODO, stationing | The dig sheet row carrying a Dig Number |
 | Surveyed by | Sidebar. The phone number is left alone — the template XLOOKUPs it from this name |
-| County, State | The alignment sheet's county band. No sidebar entry — correct it in the review table if a sheet is ever misread |
+| County, State | The alignment sheet's county band, or looked up from the dig's coordinates when no sheet covers it. Correct it in the review table if either is ever wrong |
 | Upstream / downstream reference and feet to AGM | The two reference cells, whether they name an AGM or a launch/receive valve |
 | Line name | Alignment sheet title block |
 | Alignment sheet number | Pipeline number + sheet number off the alignment sheet |
@@ -22,6 +22,7 @@ image dropped into the report's image slot.
 | HCA | Alignment sheet HCA band, falling back to the dig sheet's Is HCA column |
 | Directions | Mapbox, using the same logic as the Dig Site Directions Generator |
 | Aerial image | Satellite tiles + the uploaded KMZ centerline and placemarks |
+| Dig position | The dig sheet's ILI coordinate, or measured along the KMZ centerline between the two referenced AGMs when the sheet carries none |
 | Cheat sheet weld rows | Weld distances, with formula signs from the line's stationing direction |
 | Cheat sheet flavour | Whichever uploaded template matches the dig sheets' stationing direction |
 
@@ -214,11 +215,43 @@ and the app says so.
 
 ## When a sheet carries no coordinates
 
-Some dig sheets print ILI Latitude/Longitude only on the AGM rows, not on the
-anomaly row (the RBB and MLT sheets are like this). There is then no dig
-coordinate, so the aerial image and the driving directions cannot be built and
-the app says so per dig rather than inventing a position. Everything else on
-the report still fills in.
+Some dig sheets print ILI Latitude/Longitude only on the AGM rows, never on the
+anomaly row (the RBB and MLT sheets are like this). The sheet still says how far
+the dig sits from the AGM either side of it, and the KMZ carries both those AGMs
+and the centerline, so the position is **measured along the line** rather than
+guessed:
+
+- both referenced AGMs are located on the centerline;
+- the dig is placed between them, in proportion to the sheet's own two
+  distances — so a KMZ whose centerline length disagrees slightly with the
+  odometer still lands the dig in the right relative spot;
+- the direction comes from where the two AGMs actually fall on the line, not
+  from an assumption about how the KMZ was drawn.
+
+If only one of the two AGMs is in the KMZ there is nothing to set the direction
+from, so the dig is **not** placed — a stake on the wrong side of an AGM is
+worse than no aerial. The app says which digs it placed, and flags it when the
+KMZ and the dig sheet disagree about how far apart the AGMs are, or when the
+AGMs sit well off the centerline (usually the wrong line's KMZ).
+
+A position worked out this way feeds the aerial image, the driving directions
+and the county lookup. It is never written into the report's Latitude and
+Longitude cells — those stay blank for the field measurement, as always.
+
+## County and State
+
+They come off the alignment sheet's county band when a sheet covers the dig.
+That always wins; it is the document the report is checked against.
+
+When no alignment sheet covers it, they are looked up from the dig's
+coordinates instead — FCC first, then the Census geocoder, then Mapbox, so one
+outage does not leave the field blank. Results are cached by rounded position,
+so a batch along one line makes one request rather than twenty. If every
+service fails the field stays `Unknown`; nothing is guessed. The lookup can be
+turned off in the sidebar.
+
+Note that the geocoders return a full state name (`Oklahoma`) while the
+alignment sheets print the abbreviation (`KS`).
 
 County and State are written on every report, `Unknown` included. Leaving the
 cell untouched would keep whatever the template shipped with — the previous

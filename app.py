@@ -152,6 +152,10 @@ class Dig:
     aerial_png: Optional[bytes] = None
     notes: str = ""
 
+    # True when the coordinate was measured along the KMZ centerline rather
+    # than printed on the dig sheet.
+    position_from_kmz: bool = False
+
     warnings: list = field(default_factory=list)
 
     # --- convenience ----------------------------------------------------
@@ -2215,6 +2219,303 @@ def nearest_placemark(data: PipelineData, latitude: float, longitude: float,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Positioning a dig on the centerline
+# ---------------------------------------------------------------------------
+# Some dig sheets print ILI Latitude/Longitude only on the AGM rows, never on
+# the anomaly row, so there is no coordinate for the dig itself. The sheet does
+# say how far the dig sits from the AGM either side of it, and the KMZ carries
+# both those AGMs and the centerline, so the position can be measured along the
+# line instead of guessed.
+
+FEET_PER_METRE = 3.28084
+EARTH_RADIUS_M = 6378137.0
+
+
+def _plane(lat0: float):
+    """A local flat projection in feet, good to a fraction of a foot here.
+
+    Web Mercator is not usable for this: it stretches distances by 1/cos(lat),
+    about 25% at these latitudes, which would put a stake hundreds of feet out.
+    """
+    lat_ft = math.radians(1.0) * EARTH_RADIUS_M * FEET_PER_METRE
+    lon_ft = lat_ft * math.cos(math.radians(lat0))
+
+    def project(longitude: float, latitude: float) -> tuple:
+        return longitude * lon_ft, latitude * lat_ft
+
+    def unproject(x: float, y: float) -> tuple:
+        return x / lon_ft, y / lat_ft
+
+    return project, unproject
+
+
+def _measure_line(line, project):
+    """(points, cumulative feet) for one centerline."""
+    points = [project(lon, lat) for lon, lat in line]
+    cumulative = [0.0]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        cumulative.append(cumulative[-1] + math.hypot(x1 - x0, y1 - y0))
+    return points, cumulative
+
+
+def _arc_length_of(points, cumulative, target) -> tuple:
+    """Where a point sits along the line: (feet from the start, feet off it)."""
+    tx, ty = target
+    best = (None, None)
+    best_off = None
+    for index, ((x0, y0), (x1, y1)) in enumerate(zip(points, points[1:])):
+        vx, vy = x1 - x0, y1 - y0
+        length_squared = vx * vx + vy * vy
+        if length_squared == 0:
+            continue
+        t = ((tx - x0) * vx + (ty - y0) * vy) / length_squared
+        t = max(0.0, min(1.0, t))
+        px, py = x0 + t * vx, y0 + t * vy
+        off = math.hypot(tx - px, ty - py)
+        if best_off is None or off < best_off:
+            best_off = off
+            best = (cumulative[index] + t * math.sqrt(length_squared), off)
+    return best
+
+
+def _point_at_arc_length(points, cumulative, distance, unproject):
+    """The coordinate a given number of feet along the line."""
+    if not points:
+        return None
+    if distance <= 0:
+        return unproject(*points[0])
+    if distance >= cumulative[-1]:
+        return unproject(*points[-1])
+    for index, (start, end) in enumerate(zip(cumulative, cumulative[1:])):
+        if start <= distance <= end:
+            span = end - start
+            t = 0.0 if span == 0 else (distance - start) / span
+            (x0, y0), (x1, y1) = points[index], points[index + 1]
+            return unproject(x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+    return unproject(*points[-1])
+
+
+def position_from_pipeline(dig, pipeline) -> Optional[tuple]:
+    """Locate a dig on the centerline from its two AGM references.
+
+    Returns ``(latitude, longitude, note)``, or None when the KMZ cannot place
+    it. The dig sheet gives the distance to the AGM either side; the KMZ gives
+    where those AGMs are. Walking between them along the line puts the dig
+    where it actually sits rather than at an AGM.
+
+    With both AGMs found the distance is interpolated in proportion to the
+    sheet's own two distances, so a KMZ whose centerline length disagrees
+    slightly with the odometer still lands the dig in the right relative spot.
+    With only one AGM found there is nothing to set the direction from, so the
+    dig is not placed at all - a stake on the wrong side of an AGM is worse
+    than no aerial.
+    """
+    if pipeline is None or not pipeline.lines:
+        return None
+
+    upstream = find_placemark(pipeline, dig.upstream_reference)
+    downstream = find_placemark(pipeline, dig.downstream_reference)
+    if upstream is None or downstream is None:
+        return None
+
+    us_feet = dig.upstream_feet_to_agm
+    ds_feet = dig.downstream_feet_to_agm
+    if us_feet is None or ds_feet is None or (us_feet + ds_feet) <= 0:
+        return None
+
+    _, us_lon, us_lat = upstream
+    _, ds_lon, ds_lat = downstream
+    project, unproject = _plane((us_lat + ds_lat) / 2.0)
+
+    best = None
+    for line in pipeline.lines:
+        if len(line) < 2:
+            continue
+        points, cumulative = _measure_line(line, project)
+        us_s, us_off = _arc_length_of(points, cumulative, project(us_lon, us_lat))
+        ds_s, ds_off = _arc_length_of(points, cumulative, project(ds_lon, ds_lat))
+        if us_s is None or ds_s is None:
+            continue
+        score = (us_off or 0) + (ds_off or 0)
+        if best is None or score < best[0]:
+            best = (score, points, cumulative, us_s, ds_s, us_off, ds_off)
+
+    if best is None:
+        return None
+    _, points, cumulative, us_s, ds_s, us_off, ds_off = best
+
+    span = abs(ds_s - us_s)
+    if span <= 0:
+        return None
+
+    fraction = us_feet / (us_feet + ds_feet)
+    distance = us_s + (1 if ds_s > us_s else -1) * fraction * span
+
+    position = _point_at_arc_length(points, cumulative, distance, unproject)
+    if position is None:
+        return None
+    longitude, latitude = position
+
+    note = (
+        f"Position measured along the KMZ centerline, {us_feet:,.2f} ft "
+        f"downstream of {dig.upstream_reference}."
+    )
+    sheet_span = us_feet + ds_feet
+    if abs(span - sheet_span) > max(50.0, 0.02 * sheet_span):
+        note += (
+            f" The KMZ puts {dig.upstream_reference} and "
+            f"{dig.downstream_reference} {span:,.0f} ft apart but the dig sheet "
+            f"says {sheet_span:,.0f} ft, so check this one."
+        )
+    if max(us_off or 0, ds_off or 0) > 100.0:
+        note += (
+            f" The referenced AGMs sit up to {max(us_off, ds_off):,.0f} ft off "
+            "the centerline, so the KMZ may not be this dig's line."
+        )
+    return latitude, longitude, note
+
+
+def apply_pipeline_positions(digs, pipeline) -> list:
+    """Fill in coordinates for digs whose sheet carried none. Returns notes."""
+    notes = []
+    for dig in digs:
+        if dig.ili_latitude is not None and dig.ili_longitude is not None:
+            continue
+        placed = position_from_pipeline(dig, pipeline)
+        if placed is None:
+            continue
+        dig.ili_latitude, dig.ili_longitude, note = placed
+        dig.position_from_kmz = True
+        dig.warnings = [
+            w for w in dig.warnings
+            if "latitude/longitude" not in w
+        ]
+        notes.append(f"{dig.name}: {note}")
+    return notes
+
+
+# ==========================================================================
+# COUNTY / STATE
+# ==========================================================================
+# County and state come off the alignment sheet when one covers the dig. When
+# none does, they are looked up from the dig's coordinates instead. Three free
+# services are tried in turn so one outage does not leave the field blank; the
+# first that answers wins. Nothing is guessed - if all three fail it stays
+# Unknown.
+
+class GeocodeError(RuntimeError):
+    pass
+
+
+def _strip_county(name: str) -> str:
+    return re.sub(r"\s+County$", "", (name or "").strip(), flags=re.I)
+
+
+def _county_from_fcc(latitude: float, longitude: float) -> tuple:
+    payload = requests.get(
+        "https://geo.fcc.gov/api/census/area",
+        params={"lat": latitude, "lon": longitude, "format": "json"},
+        timeout=25, headers={"User-Agent": USER_AGENT},
+    ).json()
+    results = payload.get("results") or []
+    if not results or not results[0].get("county_name"):
+        raise GeocodeError("FCC returned no county.")
+    return _strip_county(results[0]["county_name"]), results[0].get("state_name", "")
+
+
+def _county_from_census(latitude: float, longitude: float) -> tuple:
+    payload = requests.get(
+        "https://geocoding.geo.census.gov/geocoder/geographies/coordinates",
+        params={"x": longitude, "y": latitude, "benchmark": "Public_AR_Current",
+                "vintage": "Current_Current", "layers": "States,Counties",
+                "format": "json"},
+        timeout=25, headers={"User-Agent": USER_AGENT},
+    ).json()
+    geographies = (payload.get("result") or {}).get("geographies") or {}
+    counties = geographies.get("Counties") or []
+    states = geographies.get("States") or []
+    if not counties or not states:
+        raise GeocodeError("The Census geocoder returned no county.")
+    name = counties[0].get("BASENAME") or counties[0].get("NAME", "")
+    return _strip_county(name), states[0].get("NAME", "")
+
+
+def _county_from_mapbox(latitude: float, longitude: float, token: str) -> tuple:
+    if not token:
+        raise GeocodeError("No Mapbox token.")
+    payload = requests.get(
+        f"https://api.mapbox.com/geocoding/v5/mapbox.places/"
+        f"{longitude},{latitude}.json",
+        params={"types": "district,region", "language": "en",
+                "access_token": token},
+        timeout=25,
+    ).json()
+    county = state = ""
+    for feature in payload.get("features") or []:
+        for item in [feature] + list(feature.get("context") or []):
+            kind = (item.get("id") or "").split(".")[0]
+            if kind == "district" and not county:
+                county = _strip_county(item.get("text", ""))
+            elif kind == "region" and not state:
+                state = item.get("text", "")
+    if not county or not state:
+        raise GeocodeError("Mapbox returned no county.")
+    return county, state
+
+
+def county_and_state(latitude: float, longitude: float, token: str = "") -> tuple:
+    """(county, state) from coordinates, e.g. ('Beaver', 'Oklahoma')."""
+    errors = []
+    for lookup in (
+        lambda: _county_from_fcc(latitude, longitude),
+        lambda: _county_from_census(latitude, longitude),
+        lambda: _county_from_mapbox(latitude, longitude, token),
+    ):
+        try:
+            county, state = lookup()
+            if county and state:
+                return county, state
+        except Exception as error:  # noqa: BLE001 - any failure falls through
+            errors.append(str(error))
+    raise GeocodeError("County/state lookup failed: " + "; ".join(errors))
+
+
+def apply_geocoded_county(digs, token: str = "") -> list:
+    """Fill county/state from coordinates where no alignment sheet supplied them.
+
+    The alignment sheet always wins - it is the document the report is checked
+    against. This only fills what is still Unknown. Results are cached by
+    rounded position so a batch on one line makes one request, not twenty.
+    """
+    problems = []
+    cache: dict = {}
+    for dig in digs:
+        needs = dig.county in (None, "", UNKNOWN) or dig.state in (None, "", UNKNOWN)
+        if not needs:
+            continue
+        if dig.ili_latitude is None or dig.ili_longitude is None:
+            continue
+        key = (round(float(dig.ili_latitude), 3), round(float(dig.ili_longitude), 3))
+        if key not in cache:
+            try:
+                cache[key] = county_and_state(
+                    float(dig.ili_latitude), float(dig.ili_longitude), token
+                )
+            except Exception as error:  # noqa: BLE001
+                cache[key] = None
+                problems.append(f"{dig.name}: {error}")
+        found = cache[key]
+        if not found:
+            continue
+        county, state = found
+        if dig.county in (None, "", UNKNOWN):
+            dig.county = county
+        if dig.state in (None, "", UNKNOWN):
+            dig.state = state
+    return problems
+
+
 # ==========================================================================
 # AERIAL
 # ==========================================================================
@@ -3276,6 +3577,12 @@ surveyor_name = st.sidebar.text_input(
 )
 tool_type = st.sidebar.text_input("Tool type", value=DEFAULT_TOOL_TYPE)
 staking_notes = st.sidebar.text_area("Staking notes", value=DEFAULT_STAKING_NOTES, height=110)
+lookup_county = st.sidebar.checkbox(
+    "Look up County/State from coordinates",
+    value=True,
+    help="Only for digs the alignment sheets do not cover. Uses the FCC and "
+         "Census geocoders, with Mapbox as a fallback.",
+)
 
 st.sidebar.header("Aerial image")
 make_aerial = st.sidebar.checkbox("Generate aerial images", value=True)
@@ -3405,6 +3712,23 @@ if st.button("Read uploads", type="primary", disabled=not ready):
         except Exception as error:  # noqa: BLE001
             problems.append(f"{kmz_file.name}: {error}")
 
+    # Order matters: the KMZ can supply a coordinate for a dig whose sheet
+    # printed none, and that coordinate is then what the county lookup uses.
+    placements = []
+    if pipeline is not None:
+        with st.status("Locating digs on the centerline…", expanded=False):
+            placements = apply_pipeline_positions(digs, pipeline)
+
+    if lookup_county:
+        missing = [
+            dig for dig in digs
+            if (dig.county in (None, "", UNKNOWN) or dig.state in (None, "", UNKNOWN))
+            and dig.ili_latitude is not None
+        ]
+        if missing:
+            with st.status("Looking up county and state…", expanded=False):
+                problems.extend(apply_geocoded_county(digs, token))
+
     digs.sort(key=lambda d: (d.source_file, d.odometer or 0))
     st.session_state.digs = digs
     st.session_state.sheets = sheets
@@ -3413,6 +3737,9 @@ if st.button("Read uploads", type="primary", disabled=not ready):
 
     for problem in problems:
         st.warning(problem)
+
+    for note in placements:
+        st.caption(note)
 
     if diagnostics:
         with st.expander("What the parser saw in those PDFs", expanded=True):
